@@ -106,6 +106,16 @@ config_schema:
 - `hooks` 是供管理界面展示的声明，不会自动注册，也不会与 `setup()` 中的实际注册做一致性校验
 - `permissions` 当前被宿主识别为受控能力的有：`messaging.send`、`mcp.read` / `mcp.invoke` / `mcp.publish`、`channel.register`；其他值会保留展示用于审计，但不会授予任何宿主能力
 
+仅支持部分系统的插件可额外声明：
+
+```yaml
+platforms:
+  - windows
+  - macos
+```
+
+`platforms` 可省略，表示不限制系统；填写时必须是非空、不重复的数组，只接受小写 `windows`、`macos`、`linux`，不能用 `win`、`darwin`、`null` 或空数组。判断依据是 **PawzoChat 后端服务运行的系统**，与访问面板的浏览器系统无关，也不区分 CPU 架构。系统不匹配时不能安装或启用，启动/刷新也不会执行插件入口；手动复制安装同样检查清单。在线索引若也声明了平台，必须同时满足两处限制。
+
 ---
 
 ## 4. 编写插件入口
@@ -146,7 +156,7 @@ def create_plugin() -> Plugin:
 - 插件类必须继承 `Plugin`
 - 必须实现 `setup(self, ctx)`
 - 入口函数必须返回 `Plugin` 实例
-- `teardown()` 必须幂等、快速、不抛异常。系统可能在 hook handler 仍在其他线程执行时调用 `teardown()`，因此释放资源时需考虑与已取出的 handler 并发的情况
+- `teardown()` 必须幂等、快速，并容忍 `setup()` 尚未完成。宿主卸载前暂停新 hook、工具和通道调用，已有调用未结束时拒绝管理操作；插件仍须自行停止并等待自己的线程、定时器和写入。清理抛错会阻止版本切换
 
 ---
 
@@ -187,11 +197,13 @@ ctx.personas.get(persona_id) -> Persona | None
 ctx.personas.all() -> dict[str, Persona]
 ```
 
-这些返回值都是深拷贝；修改它们不会更新宿主存储。
+这些返回值都是深拷贝；修改它们不会更新宿主存储。`ctx.conversations` 只读取角色私聊，不包含 Web 群聊历史；`persona_id` 不能替换为 `group_id`。
 
 ---
 
 ## 6. 可用 hook
+
+下列 hook 作用于私聊消息链路，Web 多角色群聊不触发这些事件。群聊仍可调用插件发布的 LLM 工具，handler 可通过群聊上下文字段区分作用域（见 §12.6.3）。
 
 ### 6.1 `message.received`
 
@@ -238,6 +250,8 @@ ctx.personas.all() -> dict[str, Persona]
 
 - 改写 `event.messages`
 - 向上下文插入额外系统提示或记忆片段
+
+`event.images` 包含当前选中历史轮次内的图片及引用图片，不再仅表示本次上传；图片可能附带上下文来源标记。使用 `event.messages` 判断发言顺序，不要把所有附件当成最新用户消息。
 
 ### 6.4 `reply.compose`
 
@@ -384,7 +398,7 @@ settings:
 
 后端当前只检查 `type`、`properties`、`required` 和 `items`，并应用 `default`。`enum`、`minimum`、`maximum` 只影响前端控件，后端不会再次检查取值范围；Schema 未声明的额外 `settings` 字段也会保留。
 
-`secret: true` 只会让前端使用密码输入框，不提供存储加密。插件设置仍以明文写入插件目录的 `config.yaml`，并会通过仅限本地的插件详情 API / 自定义面板 `init` 消息返回；API Key 等配置应按敏感文件保护。
+`secret: true` 只会让前端使用密码输入框，不提供存储加密。插件设置仍以明文写入插件目录的 `config.yaml`，并会通过本地或已登录公网的插件详情 API / 自定义面板 `init` 消息返回；API Key 等配置应按敏感文件保护。
 
 示例：
 
@@ -569,12 +583,14 @@ def create_plugin() -> Plugin:
 
 ## 11. 主动发送消息（`ctx.messaging`）
 
-`ctx.messaging.send_message(...)` 让插件以“助手身份”向某个会话直接推送一条消息（不经过 LLM），支持文本、图片、文件三种内容块。典型场景：
+`ctx.messaging.send_message(...)` 让插件以“助手身份”向某个角色私聊直接推送一条消息（不经过 LLM），支持文本、图片、文件三种内容块。典型场景：
 
 - 定时提醒（日程、生日、纪念日）
 - 外部事件通知（监控告警、消息桥接）
 - Webhook / IM 转发
 - 报表 / 凭证 / 资料文件下发
+
+此接口不支持 Web 多角色群聊，没有 `group_id` 参数；`channel="web"` 指角色的 Web 私聊。
 
 ### 11.1 声明权限
 
@@ -661,7 +677,7 @@ ctx.messaging.send_message(
 
 ### 11.6 调度由插件自行管理
 
-宿主**不**提供调度器（cron / timer 服务）。插件如果要做定时推送，需自己用 `threading.Timer` 等机制实现，并在 `teardown()` 中停止继续调度和取消未完成任务，避免插件重载后旧回调继续运行。
+宿主**不**提供调度器（cron / timer 服务）。插件如果要做定时推送，需自行实现可停止的后台线程或定时器，并在 `teardown()` 中停止调度、取消等待且确认正在执行的任务已经退出。仅调用 `Timer.cancel()` 不能停止已开始的回调；无法及时退出时应抛错，让宿主阻止在线替换。
 
 文本提醒最小示例：
 
@@ -673,36 +689,31 @@ from pawzochat.core.extensions.api import Plugin, PluginContext
 class ScheduledNudger(Plugin):
     def setup(self, ctx: PluginContext) -> None:
         self.ctx = ctx
-        self._timer: threading.Timer | None = None
         self._stopped = threading.Event()
-        self._schedule_next()
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
 
     def teardown(self) -> None:
-        self._stopped.set()
-        if self._timer is not None:
-            self._timer.cancel()
-            self._timer = None
+        # setup 可能只完成了一部分；重复清理也应安全。
+        stopped = getattr(self, "_stopped", None)
+        if stopped is not None:
+            stopped.set()
+        worker = getattr(self, "_worker", None)
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2)
+            if worker.is_alive():
+                raise RuntimeError("提醒任务尚未停止，请稍后重试")
 
-    def _schedule_next(self) -> None:
-        if self._stopped.is_set():
-            return
-        t = threading.Timer(60 * 60, self._fire)  # 1 小时后
-        t.daemon = True
-        self._timer = t
-        t.start()
-
-    def _fire(self) -> None:
-        try:
-            self.ctx.messaging.send_message(
-                persona_id=self.ctx.config.get("persona_id", ""),
-                channel="web",
-                text="时间到了，记得喝水。",
-            )
-        except Exception:
-            self.ctx.logger.exception("发送提醒失败")
-        finally:
-            if not self._stopped.is_set():
-                self._schedule_next()
+    def _run(self) -> None:
+        while not self._stopped.wait(60 * 60):  # 等待 1 小时，可随时停止
+            try:
+                self.ctx.messaging.send_message(
+                    persona_id=self.ctx.config.get("persona_id", ""),
+                    channel="web",
+                    text="时间到了，记得喝水。",
+                )
+            except Exception:
+                self.ctx.logger.exception("发送提醒失败")
 ```
 
 文件投递示例：
@@ -962,9 +973,21 @@ def handler(arguments: dict, context: dict) -> list[dict]:
 | --- | --- | --- |
 | `pending_images` | `dict[str, dict]` | `{image_id: {"data": "<base64>", "mime": "image/jpeg"}}`。文本模型收到图片时，宿主在 prompt 里以 `[图片 ID:image_id]` 文本形式暴露给 LLM，handler 通过 `image_id` 反查 base64。**识图工具的核心数据源**。 |
 | `pending_files` | `dict[str, dict]` | `{file_id: {"path": str, "name": str, "mime": str}}`，同 image 思路。 |
-| `persona` | `Persona` | 当前会话绑定的 `pawzochat.models.Persona` 数据类实例，不是字典。 |
-| `persona_id` | `str` | 当前会话 ID。 |
+| `persona` | `Persona` | 当前生成回复的 `pawzochat.transport.models.Persona` 数据类实例，不是字典。 |
+| `persona_id` | `str` | 当前回复角色的 ID；群聊中不是群 ID。 |
 | `generated_images` | `list[dict]` | 本轮 LLM 之前生成的图片记录（多数工具用不到）。 |
+
+Web 群聊调用时还会提供以下字段；私聊没有这些字段，使用 `context.get(...)` 读取：
+
+| 键 | 类型 | 说明 |
+| --- | --- | --- |
+| `conversation_type` | `str` | 群聊为 `group` |
+| `conversation_id` / `group_id` | `str` | 当前群 ID |
+| `media_dir` | `pathlib.Path` | 当前群发言的媒体暂存目录，由群服务提交 |
+| `memory_mode` | `str` | 正常群聊为 `group`，内置记忆工具仅写入当前角色的本群记忆 |
+| `is_cancelled` | `Callable[[], bool]` | 当前群发言是否已取消，耗时任务可据此提前结束 |
+
+`pending_images` / `pending_files` 可包含选中历史范围内的附件及引用附件，ID 每轮重新生成，不应跨轮缓存。群聊工具若生成图片，优先返回下述标准图片内容块，由宿主保存到正确的群媒体目录；不要仅凭 `persona_id` 把群聊产物写入私聊目录。`memory_context` 等内部记忆状态由宿主管理，插件不应直接修改。
 
 返回值（每项一个内容块）：
 
@@ -1220,7 +1243,7 @@ ctx.channels.submit_inbound(
 
 返回 `True` 表示已入队（账号已绑定角色且队列接受）。账号未绑定角色、`message.received` 被取消或队列拒绝时返回 `False`。插件**自管**收消息线程（在 `setup` 启动、`teardown` 停止），宿主不提供调度器。
 
-`images` / `files` 只会被规范化后把路径交给消息队列，宿主不会在 `submit_inbound()` 时复制源文件；插件必须保证绝对路径对应的文件至少存活到本轮消息处理完成。
+`images` / `files` 只会被规范化后把路径交给消息队列，宿主不会在 `submit_inbound()` 时复制源文件；插件必须保证绝对路径对应的文件在处理期间可读；后续轮次还会读取上下文范围内的历史附件，因此不能在本轮结束后立即删除源文件。需要长期预览的图片应保存在对应角色的 `images/` 等宿主可读取的媒体目录内。
 
 当前 facade 不会再次核对 `account_id` 是否属于本插件通道；插件必须只传入自己在 `on_start_account(Account)` 收到的 `Account.bot_id`，并在接收循环中维护账号归属。
 
@@ -1229,7 +1252,7 @@ ctx.channels.submit_inbound(
 - 宿主在账号上线 / 下线时回调 `on_start_account` / `on_stop_account`，插件据此决定为哪些账号收消息。
 - 插件被停用 / 重载 / 卸载时，实际清理顺序是：移除 hook → `plugin.teardown()` → 注销插件工具 → 通道 `shutdown()`（逐个触发 `on_stop_account`）→ 注销通道。因此 `teardown()` 不应提前销毁 `on_stop_account` 仍要使用的资源。
 - 应用初次启动时，插件通常先完成 `setup()` 和通道注册，再恢复账号；若运行中启用 / 重载插件，注册通道后还会自动重试此前因通道缺失而延迟启动的已保存账号。
-- 如果 `setup()` 半途抛错，宿主会移除已经注册的 hook、工具和通道，但不会调用该实例的 `teardown()`；插件应在 `setup()` 内对自己已经启动的线程、连接等资源做异常回滚。
+- 如果 `setup()` 半途抛错，宿主会尝试调用已创建实例的 `teardown()`，并移除已注册的 hook、工具、通道及目录下的模块；插件应让清理逻辑兼容初始化未完成的状态，可靠停止已启动的线程和连接。
 
 ---
 
@@ -1240,7 +1263,7 @@ ctx.channels.submit_inbound(
 ### 14.1 启用
 
 ```yaml
-config_ui: true                       # 简写：等价于 entry: index.html, height: auto
+config_ui: true                       # 简写：入口为 ui/index.html，高度随内容变化
 ```
 
 或显式：
@@ -1248,17 +1271,20 @@ config_ui: true                       # 简写：等价于 entry: index.html, he
 ```yaml
 config_ui:
   entry: index.html                   # 相对 ui/ 目录；旧写法 ui/index.html 也会被兼容归一化
-  height: auto                        # 或固定像素，如 480
 ```
 
 并把页面静态资源放到插件目录的 `ui/` 子目录下。声明 `config_ui` 后，宿主**不再渲染** `config_schema` 的自动表单和默认“保存配置”按钮。
+
+面板高度随页面内容自动增减，不设固定最小或最大高度。服务端会在返回的插件 HTML 中注入自动高度桥，跟随内容变化、图片与字体加载、窗口宽度变化重新测量。插件无需编写高度上报代码；旧 `config_ui.height` 字段仍可接受以兼容已有清单，但不再锁定面板高度。iframe 加载前的 `1px` 仅为占位，随后由实际内容高度替换。
+
+面板布局应采用自然文档流，让内容撑开页面。不要给 `html`、`body` 或页面容器设置依赖 iframe 视口的 `100vh`、百分比 `height` / `min-height`，否则页面与 iframe 高度会相互依赖；长内容直接展开，由宿主页面滚动。窄屏适配请根据可用宽度换行或调整排布。
 
 ### 14.2 沙箱模型
 
 宿主把面板放进一个 `<iframe sandbox="allow-scripts">`，**不带** `allow-same-origin`。这意味着：
 
 - iframe 的源是 `null`：拿不到父页面的 cookie / localStorage / DOM
-- 无法 fetch 宿主的 `/api/*`（CORS 直接拒绝）
+- 不能直接读取宿主管理 API 的响应（受同源策略限制）
 - 与宿主只能通过 `window.postMessage` 通信
 - 仍然可以执行自己的 JS、加载自己的 CSS、嵌入自己的图片
 
@@ -1272,7 +1298,8 @@ iframe → 宿主：
 | --- | --- | --- |
 | `ready` | — | iframe 加载完成，请求初始数据 |
 | `save` | `id`, `settings` | 请求保存（宿主调 `PATCH /api/plugins/{id}/config`） |
-| `resize` | `height` | 当 `height: auto` 时告知宿主调整 iframe 高度 |
+| `pawzo:config-resize` | `height` | 宿主注入的自动高度桥消息，插件无需自行发送 |
+| `resize` | `height` | 旧面板兼容消息；仅在自动高度桥尚未就绪时接受 |
 | `toast` | `level`, `message` | 弹出宿主级 toast，`level` 取 `success` / `error` / `info` |
 
 宿主 → iframe：
@@ -1283,6 +1310,8 @@ iframe → 宿主：
 | `save-result` | `id`, `ok`, `settings` 或 `error` | 保存结果回执，`id` 与对应的 `save` 请求一一对应 |
 
 宿主用 `event.source === iframe.contentWindow` 识别消息发送方（沙箱 iframe 的 `event.origin` 一律为 `"null"`，无法用作鉴别）。
+
+自动高度桥发来首条 `pawzo:config-resize` 后，宿主优先使用桥的测量结果，不再接收该页面旧的 `resize` 高度，避免已有插件的固定高度上报覆盖实际内容高度。自动测量仍在原有沙箱内运行，不增加 `allow-same-origin` 等权限。
 
 ### 14.4 最小 HTML 模板
 
@@ -1299,15 +1328,11 @@ let nextId = 1;
 const pending = new Map();
 
 function send(msg) { parent.postMessage(msg, "*"); }
-function reportSize() {
-  send({ type: "resize", height: document.body.scrollHeight });
-}
 
 window.addEventListener("message", (e) => {
   const data = e.data || {};
   if (data.type === "init") {
     document.getElementById("key").value = (data.settings || {}).api_key || "";
-    reportSize();
   } else if (data.type === "save-result") {
     const entry = pending.get(data.id);
     if (!entry) return;
@@ -1335,7 +1360,7 @@ send({ type: "ready" });
 </html>
 ```
 
-在自定义面板内做更复杂的交互（多 tab、即时校验、发送测试按钮等）时，遵循同样的握手模式即可。
+在自定义面板内做更复杂的交互（多 tab、即时校验、发送测试按钮等）时，遵循同样的握手模式即可。内容高度变化由宿主自动跟随，无需另行调用 `resize`。
 
 ### 14.5 与 `config_schema` 的关系
 
@@ -1349,11 +1374,14 @@ send({ type: "ready" });
 
 ### 14.6 静态资源服务
 
-宿主仅在插件声明了 `config_ui` 时才暴露 `GET /api/plugins/{plugin_id}/ui/<path>`，且仅限本地访问。该路由：
+宿主仅在插件声明了 `config_ui` 时才提供 `ui/` 目录的静态资源。插件详情及返回 `plugin` 详情的操作响应包含 `config_ui_url`，宿主直接用它作为 iframe 地址：无自定义面板时为 `null`，本地使用 `/api/plugins/{plugin_id}/ui/{entry}`，公网使用包含公网路径前缀的 `/api/plugins/{plugin_id}/ui-assets/{token}/{entry}`。进入详情页时会重新获取链接，避免复用过期地址。
 
-- 强制把 `<path>` 限制在插件根目录的 `ui/` 子目录内，禁止 `..` 越级
+- 两种资源路由均强制把路径限制在插件根目录的 `ui/` 子目录内，禁止目录穿越及符号链接逃逸
 - 关闭浏览器缓存（`Cache-Control: no-store`），插件重载后立刻生效
-- 公网入口访问会被插件蓝图统一拒绝并返回 403
+- 响应设置 `X-Frame-Options: SAMEORIGIN` 与 `Content-Security-Policy: frame-ancestors 'self'`，允许同源宿主嵌入沙箱 iframe
+- 普通 `/ui/` 路由在公网要求登录；签名 `/ui-assets/{token}/` 路由支持不携带 Cookie 的 `GET/HEAD` 请求
+
+签名令牌仅允许读取对应插件的 UI 文件，不能读取配置或调用管理 API；有效期 24 小时，应用重启后失效，退出登录不会立即撤销。无效、过期或用于其他插件的令牌返回 401。HTML、CSS 和 JS 中应使用相对资源路径，以保留公网前缀及令牌路径，不要硬编码以 `/` 开头的资源地址。
 
 ---
 
@@ -1368,10 +1396,11 @@ send({ type: "ready" });
 - 点击插件卡片进入详情页，查看 manifest 信息和错误详情
 - 编辑由 `config_schema` 自动渲染的配置表单
 - 重载插件
+- 在本地面板通过安装链接预览并确认安装、检查更新及升级（见第 18 节）
 
 ### REST API
 
-也可以通过 API 管理（所有端点仅限本地访问）：
+也可以通过 API 管理（公网须先登录，写请求须通过同源检查）：
 
 - `GET /api/plugins` — 列出所有插件
 - `GET /api/plugins/{plugin_id}` — 查看详情、状态、错误与插件提供的工具
@@ -1380,11 +1409,14 @@ send({ type: "ready" });
 - `POST /api/plugins/{plugin_id}/disable` — 停用
 - `POST /api/plugins/{plugin_id}/reload` — 重载
 - `PATCH /api/plugins/{plugin_id}/config` — 更新配置
-- `GET /api/plugins/{plugin_id}/ui/<path>` — 读取已声明 `config_ui` 的静态资源
+- `GET/HEAD /api/plugins/{plugin_id}/ui/<path>` — 读取已声明 `config_ui` 的静态资源
+- `GET/HEAD /api/plugins/{plugin_id}/ui-assets/{token}/<path>` — 凭有效签名令牌读取对应插件的静态资源
 
-这些端点通过公网入口访问时统一返回 403。
+列表、详情、启停、重载、配置修改和重新扫描均支持已登录的公网用户。详情以及 enable / disable / reload / 配置 PATCH 返回的 `plugin` 详情包含 `config_ui_url`（见 §14.6）。加载错误的 `last_error` 可能包含本地文件路径。
 
-当前管理器的 `refresh()` 是全量操作：`refresh`、任一插件的 enable / disable / reload，以及配置更新，都会卸载并重新发现、加载**全部**插件。`/{plugin_id}/reload` 只会先校验目标存在，并非真正的单插件热重载；插件不应假设其他插件在这些操作中保持运行。
+URL 预览、安装、取消预览、更新检查、升级和任务查询接口仅允许本地访问，完整路径见[插件概览的 REST API 表](plugins-overview.md#rest-api)。安装相关写请求须带与实际本地监听地址相同的 `Origin`，缺失时才回退检查 `Referer`；协议、主机和端口均须匹配，否则返回 403。安装进度和更新通知 SSE 也只发给本地连接。
+
+当前管理器的 `refresh()` 是全量操作：`refresh`、任一插件的 enable / disable / reload，以及配置更新，都会卸载并重新发现、加载**全部**插件。`/{plugin_id}/reload` 只会先校验目标存在，并非真正的单插件热重载；插件不应假设其他插件在这些操作中保持运行。已有 hook、工具或通道调用尚未结束时可能返回 409 `plugin_busy`，调用方应待任务结束后再尝试；清理失败返回 `recovery_required`，不继续替换版本。
 
 ### 调试建议
 
@@ -1486,11 +1518,11 @@ def create_plugin():
 
 ### 主动发送消息（定时提醒、外部告警）应该怎么做？
 
-声明 `messaging.send` 权限，在 `setup()` 里启动你自己的 `threading.Timer`（或其他调度方式），定时调用 `ctx.messaging.send_message(...)`。宿主**不**提供调度器。详见第 11 节，并务必在 `teardown()` 中阻止再次调度、取消未完成的定时器，避免插件重载后旧回调继续运行。
+声明 `messaging.send` 权限，在 `setup()` 里启动你自己的 `threading.Timer`（或其他调度方式），定时调用 `ctx.messaging.send_message(...)`。宿主**不**提供调度器。详见第 11 节，并务必在 `teardown()` 中阻止再次调度、取消等待并确认正在执行的回调退出，避免插件重载后旧任务继续运行。
 
 ### 我能不指定 provider 名就调 LLM 吗？
 
-设计接口上可以：`ctx.llm.chat_as_persona(persona_id, messages=..., ...)` 用于自动复用 persona 绑定的 provider / model / temperature / max_tokens。但截至本文核对版本，`chat_as_persona()` 与 `get_persona_binding()` 会对 `Persona` 数据类误用 `.get()`，实际会抛 `AttributeError`；修复前请用 `list_providers()` 取得 provider/model 后调用 `ctx.llm.chat(...)`。详见第 10 节。
+设计接口上可以：`ctx.llm.chat_as_persona(persona_id, messages=..., ...)` 用于自动复用 persona 绑定的 provider / model / temperature / max_tokens。但截至本文核对版本，`chat_as_persona()` 与 `get_persona_binding()` 会对 `Persona` 数据类误用 `.get()`，实际会抛 `AttributeError`；修复前可用 `list_providers()` 取得 provider 名列表，再显式指定模型调用 `ctx.llm.chat(...)`；该列表不返回模型信息。详见第 10 节。
 
 ### 插件能否直接调用 MCP 工具（如 web_search / 文件系统等）？
 
@@ -1514,4 +1546,225 @@ def create_plugin():
 
 ### 公网访问时能管理插件吗？
 
-不能。插件管理 API 整体仅限本地访问，公网请求对所有端点（包括列表和详情）均返回 403。前端设置页在公网模式下也不显示插件管理入口。
+可以。公网登录后，设置页会显示插件管理入口，可查看、修改配置、启停、重载和重新扫描插件。自定义 HTML 面板也可正常使用；其静态资源通过限时签名链接加载，配置仍由宿主通过已认证的 API 读取和保存。
+
+索引 URL 预览、下载安装、在线检查更新、升级及任务查询仅限本地面板。新增写接口严格比较 Origin 的协议、主机和实际监听端口；公网登录不能绕过。
+
+---
+
+## 18. 发布索引与自动更新
+
+### 18.1 发行包与索引协议
+
+用户粘贴的是稳定的 **http/https JSON 索引 URL**，不是 zip 地址。索引描述一个插件的一个版本，自动检查只读取索引；下载、安装和升级都需要用户确认。索引最多 1 MB，类型可为 application/json 或 text/plain。
+
+zip 的 `plugin.yaml` 位于根目录或唯一顶层子目录，且只允许一个候选插件根。包内 manifest.id/version 必须与索引完全相同。禁止符号链接、路径越界、绝对路径和规范化后同名文件。只发布源代码和静态资源，排除 config.yaml、.install.json、state/、__pycache__/、.pyc/.pyo；宿主安装时强制生成禁用配置。配置 schema 必填项要提供有效默认值，否则 URL 新装会返回 invalid_settings；可先手动安装并配置。
+
+若插件附带 macOS/Linux 脚本或程序，打包前设置其可执行权限；宿主解压时保留普通文件的可执行位，不恢复 setuid/setgid 等特殊权限。
+
+| 字段 | 类型 | 必填 | 含义 |
+|---|---|---|---|
+| pawzochat_plugin_index | integer | 是 | 必须为整数 1；不是布尔值；用于索引识别和协议演进 |
+| id | string | 是 | `[a-z0-9][a-z0-9_-]*`，最多 128 字符，与 manifest.id 相同 |
+| version | string | 是 | SemVer，与 manifest.version 完全相同 |
+| download_url | string | 是 | http/https zip 直链，建议每个版本独立地址 |
+| sha256 | string | 是 | zip 实际字节的 64 位十六进制 SHA-256 |
+| name | string | 否 | 展示名称 |
+| description | string | 否 | 简介 |
+| author | string | 否 | 作者 |
+| min_app_version | string | 否 | 最低宿主 SemVer；没有要求时省略 |
+| platforms | string[] | 否 | 非空、不重复的数组，仅 windows/macos/linux；省略表示不限系统 |
+| changelog | string | 否 | 更新说明 |
+| public_key | string | 否 | Ed25519 原始 32 字节公钥，base64 编码 |
+| signature | string | 否 | Ed25519 64 字节签名，base64 编码；必须与公钥同时提供 |
+
+版本必须写成 `1.2.0` 或 `1.2.0-rc.1` 等 SemVer，不接受 `v1.2.0`、`1.2`、前导零数字段。Git tag 可以用 `v1.2.0`，但 manifest/index 内省略 v。宿主按数值段和预发布顺序比较，升级要求严格更高的版本，不支持手动降级。`min_app_version` 同时用于预览提示及服务端安装/升级资格检查。
+
+例如 Windows 专用包在索引中使用 `"platforms": ["windows"]`，并在包内 `plugin.yaml` 使用 `platforms: [windows]`。两处声明共同限制可用系统，建议保持一致；一处省略不会清除另一处限制。索引平台不匹配时不会下载 zip，清单不匹配时在提取后拒绝，确认安装/升级时再次检查。限制会保存到宿主的 `.install.json`，后续启用和启动仍须满足。缺省的旧插件继续兼容。
+
+若 Windows 与 macOS 的实现需要不同 zip，请分别发布稳定索引 URL 和对应的包，作者在下载说明中区分。此字段只限制包的适用范围，不会自动选择多个包。旧版宿主可能不识别该字段；面向旧版发布时同时用 `min_app_version` 声明所需的宿主版本。
+
+`pawzochat_plugin_index` 是格式标识，不证明来源可信。未来破坏性协议变更会增加格式版本，旧宿主会拒绝而不是猜测解析。
+
+### 18.2 可复制的打包与索引生成脚本
+
+下例假定源码放在仓库 `plugin/`，其中有 plugin.yaml 与入口 Python 文件。把脚本保存为 `scripts/build_release.py`；本地执行前安装作者工具依赖 `python -m pip install PyYAML cryptography`。这不是要求用户在打包版 PawzoChat 中运行 pip。
+
+```python
+import base64
+import hashlib
+import json
+import os
+import re
+import zipfile
+from pathlib import Path
+from urllib.parse import quote
+
+import yaml
+
+root = Path("plugin")
+manifest = yaml.safe_load((root / "plugin.yaml").read_text(encoding="utf-8"))
+if not isinstance(manifest, dict):
+    raise ValueError("plugin.yaml 必须是对象")
+# 只有省略才表示不限系统；拒绝空值、重复项和不认识的系统名。
+if "platforms" in manifest:
+    platforms = manifest["platforms"]
+    if (not isinstance(platforms, list) or not platforms
+            or any(not isinstance(item, str) or item not in {"windows", "macos", "linux"}
+                   for item in platforms)
+            or len(set(platforms)) != len(platforms)):
+        raise ValueError("platforms 必须是不重复的非空数组，可选 windows、macos、linux")
+plugin_id, version = manifest["id"], manifest["version"]
+assert re.fullmatch(r"[a-z0-9][a-z0-9_-]*", plugin_id)
+assert isinstance(version, str), "manifest.version 请使用字符串"
+tag = os.environ.get("RELEASE_TAG", "v" + version)
+assert tag == "v" + version, "tag 必须与 manifest.version 对应"
+base_url = os.environ["DOWNLOAD_BASE_URL"].rstrip("/")
+out = Path("dist")
+out.mkdir(exist_ok=True)
+archive = out / f"{plugin_id}-{version}.zip"
+excluded = {"config.yaml", ".install.json", "state", ".git"}
+with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if rel.parts[0] in excluded or "__pycache__" in rel.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
+        if path.is_symlink():
+            raise ValueError(f"不能发布符号链接: {rel}")
+        if path.is_file():
+            package.write(path, rel.as_posix())
+
+with archive.open("rb") as stream:
+    checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+index = {
+    "pawzochat_plugin_index": 1,
+    "id": plugin_id,
+    "version": version,
+    "download_url": base_url + "/" + quote(archive.name),
+    "sha256": checksum,
+    "name": manifest.get("name", plugin_id),
+    "description": manifest.get("description", ""),
+    "author": manifest.get("author", ""),
+    "changelog": Path("RELEASE_NOTES.md").read_text(encoding="utf-8") if Path("RELEASE_NOTES.md").exists() else "",
+}
+if os.environ.get("MIN_APP_VERSION"):
+    index["min_app_version"] = os.environ["MIN_APP_VERSION"]
+if "platforms" in manifest:
+    index["platforms"] = manifest["platforms"]
+
+# 未配置密钥时发布无签名索引；开始使用签名后应持续保管同一私钥。
+if os.environ.get("PLUGIN_SIGNING_KEY"):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    private = Ed25519PrivateKey.from_private_bytes(
+        base64.b64decode(os.environ["PLUGIN_SIGNING_KEY"], validate=True)
+    )
+    index["public_key"] = base64.b64encode(private.public_key().public_bytes_raw()).decode("ascii")
+    fields = ("download_url", "id", "min_app_version", "pawzochat_plugin_index", "sha256", "version")
+    signed = {k: index.get(k, "") for k in fields}
+    if "platforms" in index:
+        signed["platforms"] = index["platforms"]
+    payload = json.dumps(signed,
+                         sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    index["signature"] = base64.b64encode(private.sign(payload)).decode("ascii")
+
+(out / "plugin-index.json").write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+print(f"已生成 {archive.name} 和 plugin-index.json")
+```
+
+脚本使用 Python 3.11+，产出的索引使用实际包哈希，可直接发布。清单中的平台限制原样复制到索引；清单省略该字段时，索引也省略，绝不生成空列表。平台声明无效时在打包前报错。一次本地运行示例：
+
+```sh
+DOWNLOAD_BASE_URL=https://example.com/plugins/v1.2.0 MIN_APP_VERSION=0.2.2 python scripts/build_release.py
+```
+
+Windows PowerShell 可先设置 `$env:DOWNLOAD_BASE_URL` 和 `$env:MIN_APP_VERSION`，再运行脚本。把 zip 和 plugin-index.json 上传到对应地址；给用户提供长期不变的索引 URL。重新发布必须更新 manifest 的版本，不能只覆盖旧 zip。
+
+### 18.3 三个平台的 SHA-256 校验
+
+```sh
+# macOS
+shasum -a 256 dist/reply_filter-1.2.0.zip
+# Linux
+sha256sum dist/reply_filter-1.2.0.zip
+```
+
+```powershell
+# Windows PowerShell
+(Get-FileHash .\dist\reply_filter-1.2.0.zip -Algorithm SHA256).Hash.ToLower()
+```
+
+哈希针对 zip 原始内容，不是解压目录。上述脚本已自动计算；如手工生成索引，必须在最终打包完成后再填 sha256。
+
+### 18.4 签名与公钥连续性
+
+可选签名的基础六字段为 download_url、id、min_app_version、pawzochat_plugin_index、sha256、version。索引存在 platforms 时，额外把原始数组纳入签名；数组顺序不改写，不排序或去重。缺省时不添加此字段，继续兼容旧六字段签名。键按字母排序，无额外空白，ensure_ascii=True，UTF-8 字节；min_app_version 缺失时载荷用空字符串。平台限制的添加、删除或修改必须重新签名。name、description、author、changelog 不签名，不能拿这些展示字段作为作者认证凭据。
+
+首次生成 Ed25519 密钥的本地示例（不要在 CI 日志输出私钥）：
+
+```python
+import base64, os
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+key = Ed25519PrivateKey.generate()
+fd = os.open("plugin-signing-key.txt", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as stream:
+    stream.write(base64.b64encode(key.private_bytes_raw()).decode("ascii"))
+print("作者公钥:", base64.b64encode(key.public_key().public_bytes_raw()).decode("ascii"))
+```
+
+把私钥保存到密码管理器或 GitHub Actions Secret `PLUGIN_SIGNING_KEY`，不要加入索引、zip 或版本库；可将公钥发布在可信 README 渠道供用户首次核对。索引自带公钥只能证明包和该公钥签名一致，不能独立证明身份。宿主安装后固定公钥，后续换钥或撤销签名会阻止直接提交，要求用户针对该次包、版本和安装代次确认。
+
+### 18.5 GitHub Actions 发布示例
+
+先保存 §18.2 的脚本，再将下面内容放到 `.github/workflows/plugin-release.yml`。推送与 manifest.version 对应的 `v*` tag 后，生成 zip/索引并发布 GitHub Release。示例使用 [actions/checkout](https://github.com/actions/checkout) 和 [GitHub CLI 的 release create](https://cli.github.com/manual/gh_release_create)。
+
+```yaml
+name: Publish plugin
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install publisher dependencies
+        run: python -m pip install PyYAML cryptography
+      - name: Build package and index
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DOWNLOAD_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
+          MIN_APP_VERSION: "0.2.2"
+          PLUGIN_SIGNING_KEY: ${{ secrets.PLUGIN_SIGNING_KEY }}
+        run: python scripts/build_release.py
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --title "$RELEASE_TAG" --generate-notes
+```
+
+常规稳定版的索引地址可使用 `https://github.com/OWNER/REPO/releases/latest/download/plugin-index.json`；下载包地址则固定到具体 tag。发布预发行版时给 gh 加 `--prerelease`，并使用独立的预发行索引地址，避免把测试版本当作稳定版入口。工作流重复运行若 Release 已存在会失败，可核验产物后按 [release upload](https://cli.github.com/manual/gh_release_upload) 文档补传；不要无审计地覆盖已发布包。
+
+### 18.6 大包、升级与自动恢复的数据约定
+
+默认索引 1 MB、zip 500 MB、解压 2048 MB，下载总期限 600 秒。带模型、词库、音色的包应尽量精简，主 config.yaml 可调整后重启：
+
+```yaml
+plugins:
+  max_download_mb: 500
+  max_unzipped_mb: 2048
+  download_timeout_seconds: 600
+```
+
+大小可设 0 表示不限制，超时必须为正；压缩比/成员数量限制仍启用。打包版没有 pip，作者必须使用宿主已有依赖或随包携带可兼容的纯 Python 代码。
+
+`.install.json` 保存真实来源、版本、公钥、安装代次及索引声明的平台限制，完全由宿主生成；插件不要读写它。持久化业务数据放 state/。升级保留 config/settings、state 和启用状态；失败自动恢复提交前的完整快照。更新成功并通过加载检查后自动删除旧版快照，不提供手动降级；后续问题需发布更高版本修复。新版应兼容或迁移现有数据，并在 setup 中检查不支持的数据版本。失败的候选数据先隔离，完整恢复后自动清理；未完成恢复的现场不会自动删除。文件事务无法撤销网络发送等外部副作用。
+
+teardown 必须停止自管线程、定时器并结束状态写入；宿主不能在后台回调仍运行时安全替换代码。忙碌或无法确认停止的插件会拒绝在线替换。插件声明的权限用于用户审计，不是 Python 代码沙箱。
+
+操作者简明流程见[插件概览第 12 节](plugins-overview.md#12-url-安装发布与更新)。

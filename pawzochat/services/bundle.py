@@ -18,15 +18,17 @@
 
 Bundle layout:
 
-    pawzochat.json    — manifest + full persona config (name, llm, memory…)
+    pawzochat.json    — manifest + portable persona settings
     prompt.json       — three-section prompt payload
     avatar.png        — optional 256x256 avatar
+    image_refs/ref.png — optional custom reference image
     worldbooks/*.json — copy of each bound worldbook (native format)
 
-Bundles preserve every PawzoChat-specific field (memory, proactive,
-tool_policy, per-book scope/keywords), which a SillyTavern card cannot
-represent even via extensions when the recipient doesn't know about the
-``pawzochat`` extension namespace.
+Bundles preserve PawzoChat role settings (memory policy, proactive messages,
+tools, image/voice generation and per-book scope/keywords). They do not include
+memory entries, conversation history, provider credentials, emoji assets or
+local account/group bindings. SillyTavern cards carry role settings in the
+``pawzochat`` extension, which other clients may not understand.
 """
 
 from __future__ import annotations
@@ -67,6 +69,8 @@ class BundleImportResult:
     reference_image_png: bytes | None = None
     books: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # An explicit blank prompt must not turn into the application's default.
+    has_system_instructions: bool = False
 
 
 def _persona_config_from(persona: Persona) -> dict:
@@ -80,7 +84,8 @@ def _persona_config_from(persona: Persona) -> dict:
         "emoji_enabled": persona.emoji_enabled,
         "emoji_send_probability": persona.emoji_send_probability,
         "emoji_group": persona.emoji_group,
-        "memory": dict(persona.memory),
+        # Group IDs point to local memory archives, which are not bundled.
+        "memory": {key: value for key, value in persona.memory.items() if key != "group_reads"},
         "proactive": dict(persona.proactive),
         "tool_policy": dict(persona.tool_policy),
         "image_generation": dict(persona.image_generation),
@@ -97,6 +102,10 @@ def pack_persona(
     bound_books: list[dict] | None = None,
 ) -> bytes:
     """Return a ZIP byte-string containing persona + prompt + avatar + books."""
+    books = bound_books or []
+    config = _persona_config_from(persona)
+    book_names = {str(book.get("name") or "").strip() for book in books}
+    config["bound_worldbooks"] = [name for name in persona.bound_worldbooks if name in book_names]
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.comment = b"84aw4m7c964"
@@ -104,7 +113,7 @@ def pack_persona(
             "kind": BUNDLE_KIND,
             "version": BUNDLE_VERSION,
             "exporter_version": _PKG_VERSION,
-            "persona": _persona_config_from(persona),
+            "persona": config,
         }
         zf.writestr(MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2))
         zf.writestr(PROMPT_NAME, json.dumps(
@@ -119,7 +128,7 @@ def pack_persona(
             zf.writestr(AVATAR_NAME, avatar_png)
         if reference_image_png:
             zf.writestr(CUSTOM_REFERENCE_ZIP_PATH, reference_image_png)
-        for book in (bound_books or []):
+        for book in books:
             name = str(book.get("name") or "").strip()
             if not name:
                 continue
@@ -150,18 +159,23 @@ def unpack_persona(zip_bytes: bytes) -> BundleImportResult:
             raise ValueError(f"不是 PawzoChat 角色包（kind={manifest.get('kind')!r}）")
 
         persona_cfg = manifest.get("persona") or {}
+        if isinstance(persona_cfg.get("memory"), dict):
+            # Older bundles included these non-portable archive references.
+            persona_cfg["memory"].pop("group_reads", None)
         name = str(persona_cfg.get("name") or "").strip()
         if not name:
             raise ValueError("角色包缺少 name 字段")
 
         warnings: list[str] = []
         char, examples, system = "", "", ""
+        has_system_instructions = False
         if PROMPT_NAME in names:
             try:
                 prompt = json.loads(zf.read(PROMPT_NAME).decode("utf-8"))
                 char = str(prompt.get("character_prompt") or "")
                 examples = str(prompt.get("output_examples") or "")
                 system = str(prompt.get("system_instructions") or "")
+                has_system_instructions = "system_instructions" in prompt
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 warnings.append(f"{PROMPT_NAME} 损坏，已使用空 prompt: {exc}")
 
@@ -187,6 +201,12 @@ def unpack_persona(zip_bytes: bytes) -> BundleImportResult:
             if isinstance(book, dict) and book.get("name"):
                 books.append(book)
 
+        # ZIP entry names need not follow the persona's binding order.
+        bound_names = persona_cfg.get("bound_worldbooks")
+        if isinstance(bound_names, list):
+            order = {name: i for i, name in enumerate(bound_names) if isinstance(name, str)}
+            books.sort(key=lambda book: order.get(str(book["name"]), len(bound_names)))
+
     return BundleImportResult(
         name=name,
         persona_config=persona_cfg,
@@ -197,4 +217,5 @@ def unpack_persona(zip_bytes: bytes) -> BundleImportResult:
         reference_image_png=reference_image_png,
         books=books,
         warnings=warnings,
+        has_system_instructions=has_system_instructions,
     )

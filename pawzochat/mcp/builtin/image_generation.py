@@ -38,6 +38,7 @@ from __future__ import annotations
 import base64
 import logging
 import secrets
+from pathlib import Path
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -211,7 +212,10 @@ def make_handler(app: App) -> Callable[[dict, dict], list[ContentBlock]]:
             "jpg" if mime.endswith("/jpeg") or mime.endswith("/jpg") else "png"
         )
         image_id = secrets.token_hex(8)
-        out_dir = CHATS_DIR / persona_id / "images"
+        # The role still selects its own avatar/reference; only the generated
+        # artifact belongs to the group staging directory when one is supplied.
+        media_dir = context.get("media_dir")
+        out_dir = (Path(media_dir) if media_dir is not None else CHATS_DIR / persona_id) / "images"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"gen_{image_id}.{ext}"
         try:

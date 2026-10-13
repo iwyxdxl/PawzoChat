@@ -100,6 +100,23 @@ PawzoChat 的界面样式几乎全部由 **CSS 变量**（自定义属性）驱�
 | `--shadow-card` | `0 1px 3px rgba(0,0,0,0.06)` | 卡片阴影 |
 | `--shadow-float` | `0 -4px 24px rgba(0,0,0,0.12)` | 浮层阴影 |
 
+### 统一控件
+
+新版按钮、表单、复选框与开关共用以下变量，群设置和插件管理等页面也会使用：
+
+| 变量 | 默认值（浅色） | 说明 |
+|------|---------------|------|
+| `--control-height` | `44px` | 常规控件高度 |
+| `--control-height-sm` | `32px` | 小按钮高度 |
+| `--control-font-size` | `14px` | 控件字号 |
+| `--control-gap` | `8px` | 控件组间距 |
+| `--control-on-primary` | `#fff` | 主色底上的文字或图标；深色默认为 `var(--bg)` |
+| `--radius-check` | `4px` | 复选框圆角 |
+| `--switch-width` / `--switch-height` | `38px` / `22px` | 开关尺寸 |
+| `--switch-off` | `#D9D9D9` | 开关关闭态背景；深色为 `#494949` |
+
+提示词输入框由脚本自动调整高度。主题可调整字体、配色和间距，避免强制固定高度或使用 `height: ... !important`，以免妨碍全文展开和光标跟随。
+
 ### 其他
 
 | 变量 | 默认值 | 说明 |
@@ -109,7 +126,7 @@ PawzoChat 的界面样式几乎全部由 **CSS 变量**（自定义属性）驱�
 | `--bar-h-bottom` | `56px` | 底栏高度；桌面布局默认覆盖为 `52px` |
 | `--ease` | `cubic-bezier(0.34, 1.56, 0.64, 1)` | 部分过渡动画曲线 |
 
-源码还定义了几个兼容别名：`--border` → `--divider`、`--text` → `--text-1`、`--radius` → `--radius-card`。覆盖主变量通常就足够；只有直接样式使用这些别名时才需要单独覆盖。
+源码还定义了几个兼容别名：`--border` → `--divider`、`--text` → `--text-1`、`--radius` → `--radius-card`。通常覆盖主变量即可；但默认深色块单独设置了 `--border`，若修改深色分割线并希望边框同步，请同时覆盖 `--divider` 和 `--border`。
 
 ### 设置列表图标色板
 
@@ -218,7 +235,10 @@ PawzoChat 的界面样式几乎全部由 **CSS 变量**（自定义属性）驱�
 | `.card` | 设置/信息卡片 |
 | `.card-row` | 卡片内的行条目 |
 | `.row-icon` | 行条目前的图标 |
-| `.conv-item` | 会话列表条目 |
+| `.conv-item` | 私聊与群聊的会话列表条目 |
+| `.conv-draft-label` | 会话预览中的“草稿”标记 |
+| `.group-avatar` | 群头像或成员组合头像 |
+| `.group-member-prompt` | 群成员专属提示词折叠区 |
 | `.chat-container` | 聊天窗口容器 |
 | `.chat-messages` | 消息列表区域 |
 | `.msg-bubble` | 消息气泡 |
@@ -230,6 +250,12 @@ PawzoChat 的界面样式几乎全部由 **CSS 变量**（自定义属性）驱�
 | `.avatar` | 头像 |
 | `.search-bar` | 搜索框 |
 | `.btn-primary` | 主操作按钮 |
+| `.btn-secondary` / `.btn-outline` / `.btn-text` | 次要、描边和文字按钮 |
+| `.btn-sm` | 小尺寸按钮修饰类 |
+| `.form-input` | 统一表单输入控件 |
+| `.prompt-input` | 自动高度提示词输入框 |
+| `.switch-wrap` / `.switch-track` | 开关容器与轨道 |
+| `.form-actions` | 表单操作按钮组 |
 | `#overlay` | 遮罩层 |
 | `#action-sheet` | 底部弹出菜单 |
 | `#confirm-dialog` | 确认对话框 |
@@ -275,6 +301,7 @@ PawzoChat 的界面样式几乎全部由 **CSS 变量**（自定义属性）驱�
   --text-2: #D8B0C0;
   --text-3: #9E7786;
   --divider: #3A1E2A;
+  --border: var(--divider);
   --bg-hover: #341820;
   --search-bg: #341820;
   --tab-bar-bg: rgba(36, 19, 25, 0.92);
@@ -292,5 +319,6 @@ PawzoChat 的界面样式几乎全部由 **CSS 变量**（自定义属性）驱�
 - **外部图片**：CSS 中可以使用 `url()` 引用外部图片。公网面板为 HTTPS 时应使用 HTTPS 资源，否则浏览器可能按混合内容阻止加载。
 - **多主题叠加**：启用多个主题时，排在后面的主题会覆盖前面主题的同名属性。利用这个特性，可以做一个"基础配色主题"加一个"聊天背景主题"组合使用。
 - **安全性**：主题 CSS 不做内容净化，可以隐藏界面、覆盖交互区域或向外部地址发起资源请求。只导入可信来源的主题。
+- **插件自定义面板**：主题作用于宿主页面和自动生成的插件配置表单；沙箱 iframe 内的自定义 HTML 不继承宿主 CSS，需要插件自行提供样式。
 - **维护性**：CSS 变量是相对稳定的入口；直接覆盖组件选择器可能随前端重构失效。
 - **参考源码**：完整默认样式见 `pawzochat/web/static/style.css` 和 `pawzochat/web/static/desktop.css`。

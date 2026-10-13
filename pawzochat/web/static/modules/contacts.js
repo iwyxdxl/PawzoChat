@@ -15,13 +15,14 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-import { avatarHtml, personaAvatarUrl, esc, CAP_ICONS, ILLEGAL_NAME_RE, voiceOptionsHtml, voiceCatalogFor } from "./utils.js";
+import { setPromptValue } from "./prompt_textarea.js";
+import { avatarHtml, personaAvatarUrl, esc, escAttr, CAP_ICONS, ILLEGAL_NAME_RE, voiceOptionsHtml, voiceCatalogFor } from "./utils.js";
 import { api, downloadFile } from "./api.js";
 import { state, $, content, sidebar } from "./state.js";
 import { toast, confirm, showLoading, hideLoading, showSheet, closeOverlay } from "./ui.js";
 import {
   setTopBar, pushPage, goBack,
-  registerTabRenderer, registerPageRenderer,
+  registerTabRenderer, registerPageRenderer, setPageCleanup,
   isDesktop, setSidebarBar, refreshSidebar,
 } from "./navigation.js";
 import { fetchWorldbookSummary, openWorldbookPicker } from "./worldbook.js";
@@ -37,6 +38,9 @@ let _pendingAvatarBlob = null;
 // mutated by peWorldbookAdd / peWorldbookRemove, read back in savePersona.
 let _peBoundWorldbooks = [];
 let _peWorldbookSummary = { ok: true, globals: [], selectable: [] };
+let _peMemoryGroupReads = {};
+let _peMemorySources = [];
+let _personaEditGeneration = 0;
 
 function _decodeDataValue(value) {
   try {
@@ -146,7 +150,7 @@ export async function personaImportSubmit(inputEl) {
       showSheet(`<div style="padding:24px">
         <div class="sheet-title">导入提示</div>
         <ul style="text-align:left;margin:12px 0 20px;padding-left:20px;font-size:14px;color:var(--text-2);line-height:1.6">${items}</ul>
-        <button onclick="PawzoChat.closeOverlay()" style="width:100%;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">知道了</button>
+        <button class="btn-primary" onclick="PawzoChat.closeOverlay()">知道了</button>
       </div>`);
     }
     renderContacts();
@@ -159,14 +163,14 @@ export async function personaImportSubmit(inputEl) {
 export function personaExportPick(personaId) {
   const bookLabel = "导出时包含绑定世界书";
   const recommendedBadge = `<span style="display:inline-block;margin-left:6px;padding:1px 6px;border-radius:10px;background:var(--primary);color:#fff;font-size:11px;font-weight:500;vertical-align:1px">推荐</span>`;
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">导出角色</div>
     <div class="form-hint" style="padding:8px 0 4px;text-align:left">选择导出格式：</div>
     <div class="card" style="margin:4px 0">
       <div class="card-row" style="cursor:pointer" onclick="PawzoChat._personaExportGo('${personaId}','bundle')">
         <div style="flex:1;min-width:0">
           <div style="font-size:15px">PawzoChat 原生包 (.zip)${recommendedBadge}</div>
-          <div style="font-size:12px;color:var(--text-3);margin-top:2px">保留全部 PawzoChat 字段（记忆/主动消息/绑定书…），适合 PawzoChat 之间迁移</div>
+          <div style="font-size:12px;color:var(--text-3);margin-top:2px">包含角色提示词、头像、参考图及功能配置，适用于向其他 PawzoChat 用户分享您的角色设定</div>
         </div><span class="row-arrow">›</span>
       </div>
       <div class="card-row" style="cursor:pointer" onclick="PawzoChat._personaExportGo('${personaId}','png')">
@@ -182,12 +186,13 @@ export function personaExportPick(personaId) {
         </div><span class="row-arrow">›</span>
       </div>
     </div>
+    <div class="form-hint" style="padding:8px 0 4px;text-align:left">角色导出不含记忆条目和聊天记录，也不包含服务商配置、表情包文件或账号、群聊绑定。</div>
     <label class="card-row" style="cursor:pointer;margin:8px 0 12px">
       <input type="checkbox" id="pe-export-books" checked style="margin-right:10px">
       <div style="flex:1;min-width:0"><div style="font-size:14px">${bookLabel}</div>
       <div style="font-size:12px;color:var(--text-3);margin-top:2px">原生包独立打包；SillyTavern 格式合并为 character_book</div></div>
     </label>
-    <button onclick="PawzoChat.closeOverlay()" style="width:100%;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
+    <button class="btn-secondary btn-block" onclick="PawzoChat.closeOverlay()">取消</button>
   </div>`);
 }
 
@@ -223,7 +228,7 @@ function _personaExportPngPick(personaId, includeBooks) {
   const base = window.PAWZOCHAT_BASE || "";
   const avUrl = `${base}/api/personas/${personaId}/avatar?t=${Date.now()}`;
   _pendingExportOriginalAvatarUrl = avUrl;
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">导出 v3 PNG</div>
     <div class="form-hint" style="padding:8px 0 12px;text-align:left">卡片图像将作为角色数据的容器。你可以使用当前头像，或上传一张其它图片作为这张卡的封面。</div>
     <div style="display:flex;justify-content:center;margin:8px 0 16px">
@@ -231,12 +236,12 @@ function _personaExportPngPick(personaId, includeBooks) {
     </div>
     <input type="file" id="pe-export-cover-file" accept="image/*" style="display:none" onchange="PawzoChat._personaExportCoverSelected(this)">
     <div style="display:flex;gap:8px;margin-bottom:14px">
-      <button onclick="document.getElementById('pe-export-cover-file').click()" style="flex:1;padding:10px;border:1px solid var(--border);border-radius:var(--radius-btn);background:var(--bg);color:var(--text-1);font-size:14px;cursor:pointer;font-family:var(--font)">选择其它图片</button>
-      <button onclick="PawzoChat._personaExportCoverReset()" id="pe-export-cover-reset" style="flex:1;padding:10px;border:1px solid var(--border);border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:14px;cursor:pointer;font-family:var(--font);display:none">还原当前头像</button>
+      <button class="btn-outline" onclick="document.getElementById('pe-export-cover-file').click()" style="flex:1">选择其它图片</button>
+      <button class="btn-outline" onclick="PawzoChat._personaExportCoverReset()" id="pe-export-cover-reset" style="flex:1;display:none">还原当前头像</button>
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat._personaExportPngGo('${personaId}', ${includeBooks ? 1 : 0})" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">下载</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat._personaExportPngGo('${personaId}', ${includeBooks ? 1 : 0})">下载</button>
     </div>
   </div>`);
 }
@@ -312,8 +317,8 @@ export function filterPersonas(val) {
 /* ---- Persona Detail ---- */
 
 async function renderPersonaDetail(data) {
-  const topBtns = `<button class="btn-text" onclick="PawzoChat.personaExportPick('${data.personaId}')" style="font-size:15px;font-weight:500;padding:8px 8px">导出</button>
-    <button class="btn-text" onclick="PawzoChat.pushPage('personaEdit',{personaId:'${data.personaId}'})" style="font-size:15px;font-weight:500;padding:8px 8px">编辑</button>`;
+  const topBtns = `<button class="btn-text" onclick="PawzoChat.personaExportPick('${data.personaId}')">导出</button>
+    <button class="btn-text" onclick="PawzoChat.pushPage('personaEdit',{personaId:'${data.personaId}'})">编辑</button>`;
   setTopBar("角色详情", true, topBtns);
   content().innerHTML = `<div class="loading-center"><div class="spinner"></div></div>`;
   try {
@@ -399,7 +404,7 @@ async function renderPersonaDetail(data) {
         <div class="card-row"><span class="row-label">状态</span><span class="row-value">${vg.enabled ? '已开启' : '已关闭'}</span></div>
         <div class="card-row"><span class="row-label">服务商</span><span class="row-value" style="${truncStyle(vg.provider, 0)}">${esc(vg.provider || "未配置")}</span></div>
         <div class="card-row"><span class="row-label">模型</span><span class="row-value" style="${truncStyle(vg.model, 0)}">${esc(vg.model || "未选择")}</span></div>
-        <div class="card-row"><span class="row-label">语速</span><span class="row-value">${voiceControls?.family === "mimo" ? esc(voiceControls.rates?.[vg.mimo?.speaking_rate || "auto"] || "自动") : `${vg.speed ?? 1.0}x`}</span></div>
+        ${voiceControls?.family === "elevenlabs" ? "" : `<div class="card-row"><span class="row-label">语速</span><span class="row-value">${voiceControls?.family === "mimo" ? esc(voiceControls.rates?.[vg.mimo?.speaking_rate || "auto"] || "自动") : `${vg.speed ?? 1.0}x`}</span></div>`}
         <div class="card-row"><span class="row-label">音色</span><span class="row-value" style="${truncStyle(vg.voice, 0)}">${esc(vg.voice || "模型默认")}</span></div>
       </div>`;
       })()}
@@ -429,11 +434,12 @@ export async function chatWithPersona(personaId) {
 }
 
 export async function deletePersona(personaId) {
-  const ok = await confirm("删除角色", "确认删除该角色？相关对话也会被删除。", true);
+  const ok = await confirm("删除角色", "私聊记录和该角色在所有群中的记忆将被删除，群聊历史保留。确认删除？", true);
   if (!ok) return;
   showLoading("删除中…");
   try {
-    await api.del(`/api/personas/${personaId}?delete_conversation=true`);
+    const res = await api.del(`/api/personas/${personaId}?delete_conversation=true`);
+    if (res.status >= 400) { toast(res.data?.error || "删除失败", "error"); return; }
     toast("已删除", "success");
     goBack();
     refreshSidebar();
@@ -444,11 +450,29 @@ export async function deletePersona(personaId) {
 /* ---- Persona Edit ---- */
 
 async function renderPersonaEdit(data) {
-  _pendingAvatarBlob = null;
+  const generation = ++_personaEditGeneration;
+  setPageCleanup(() => {
+    if (generation !== _personaEditGeneration) return;
+    ++_personaEditGeneration;
+    if (document.querySelector('.memory-source-sheet')) closeOverlay();
+  });
   const isNew = data.isNew;
   setTopBar(isNew ? "新建角色" : "编辑角色", true,
-    `<button class="btn-text" onclick="PawzoChat.savePersona(${isNew})" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.savePersona(${isNew})">保存</button>`
   );
+  if (data.memoryDraft) {
+    const draft = data.memoryDraft;
+    delete data.memoryDraft;
+    content().replaceChildren(draft.fragment);
+    _pendingAvatarBlob = draft.avatar;
+    _peBoundWorldbooks = draft.worldbooks;
+    _peMemoryGroupReads = draft.groupReads;
+    _peMemorySources = draft.memorySources;
+    content().scrollTop = draft.scroll;
+    refreshPersonaMemorySources(data.personaId);
+    return;
+  }
+  _pendingAvatarBlob = null;
 
   let providers = [];
   let emojiGroups = [];
@@ -470,6 +494,7 @@ async function renderPersonaEdit(data) {
     voicePresetVoices = voiceRes.preset_voices || {};
     voiceDefaults = voiceRes.voice_defaults || {};
   } catch (e) { /* silent */ }
+  if (generation !== _personaEditGeneration) return;
 
   // Defaults for a brand-new persona. Keep proactive defaults in sync with
   // pawzochat/transport/models.py:PROACTIVE_DEFAULTS (the Python side is the
@@ -498,9 +523,15 @@ async function renderPersonaEdit(data) {
       p = await api.get(`/api/personas/${data.personaId}`);
     } catch (e) { /* silent */ }
   }
+  if (generation !== _personaEditGeneration) return;
+
+  const worldbookSummary = await fetchWorldbookSummary();
+  if (generation !== _personaEditGeneration) return;
 
   _peBoundWorldbooks = Array.isArray(p.bound_worldbooks) ? [...p.bound_worldbooks] : [];
-  _peWorldbookSummary = await fetchWorldbookSummary();
+  _peMemoryGroupReads = { ...(p.memory?.group_reads || {}) };
+  _peMemorySources = [];
+  _peWorldbookSummary = worldbookSummary;
   const worldbookReady = _peWorldbookSummary.ok !== false;
 
   const provOptions = providers.map(pr => `<option value="${esc(pr.name)}" ${pr.name === p.llm_provider ? "selected" : ""}>${esc(pr.name)}</option>`).join("");
@@ -640,14 +671,15 @@ async function renderPersonaEdit(data) {
       <div class="form-group"><div class="form-row"><label>启用记忆</label>
         <label class="switch-wrap"><input type="checkbox" id="pe-mem-en" ${p.memory?.enabled !== false ? "checked" : ""}><span class="switch-track"></span></label>
       </div></div>
-      <div class="form-hint">开启后按所选触发方式记录对话记忆；AI 自主记录需模型支持并允许使用记忆工具，按轮数总结无需工具调用。已有记忆也可在下方手动管理</div>
+      <div class="form-hint">开启后按所选触发方式记录私聊记忆。群聊是否记录由群设置中该角色的开关决定；群聊沿用这里的记忆条数、触发方式和轮数。</div>
       <div class="form-group"><div class="form-row"><label>最大记忆条数</label>
         <div class="stepper"><button onclick="PawzoChat.step('pe-mem-max',-1)">−</button><span class="stepper-val" id="pe-mem-max">${p.memory?.max_memories || 50}</span><button onclick="PawzoChat.step('pe-mem-max',1)">+</button></div>
       </div></div>
-      <div class="form-group"><div class="form-row"><label>包含在提示词</label>
+      <div class="form-group"><div class="form-row"><label>读取记忆</label>
         <label class="switch-wrap"><input type="checkbox" id="pe-mem-inc" ${p.memory?.include_in_prompt !== false ? "checked" : ""}><span class="switch-track"></span></label>
       </div></div>
-      <div class="form-hint">开启后 AI 可读取已有记忆；能否自主新增或更新由触发方式及记忆工具是否可用决定。关闭后 AI 看不到已有记忆，也无法自主更新它们</div>
+      <div class="form-hint">控制私聊读取自己的私聊记忆，以及下方选中的群记忆。关闭不影响角色在群聊中读取本群记忆；群内读取私聊记忆仍遵循此开关。</div>
+      ${!isNew && p.id ? `<button type="button" class="card-row memory-source-entry" id="pe-memory-sources"><span class="row-label">读取的群聊记忆</span><span class="row-value" id="pe-memory-sources-summary">选择群聊</span><span class="row-arrow">›</span></button><div class="form-hint" id="pe-memory-read-hint" hidden>当前私聊不读取记忆，已选群聊会在开启后生效。</div>` : ''}
       <div class="form-group"><div class="form-row"><label>触发方式</label>
         <select id="pe-mem-trigger-mode" onchange="PawzoChat.onPeMemTriggerModeChange()">
           <option value="remind" ${!["summarize", "summarize_only"].includes(p.memory?.trigger_mode) ? "selected" : ""}>AI 自主记录＋定期提醒（默认）</option>
@@ -660,7 +692,7 @@ async function renderPersonaEdit(data) {
       </div></div>
       <div class="form-hint" id="pe-mem-trigger-hint">${_memoryTriggerHint(p.memory?.trigger_mode)}</div>
       ${!isNew && p.id ? `<div style="padding:8px 16px 12px">
-        <button class="btn-outline" onclick="PawzoChat.pushPage('memoryManage',{personaId:'${p.id}'})" style="width:100%">管理记忆 (${p.memory_count || 0} 条)</button>
+        <button class="btn-outline" id="pe-manage-memory" style="width:100%">管理记忆</button>
       </div>` : ''}
     </div>
     ${(() => {
@@ -709,8 +741,8 @@ async function renderPersonaEdit(data) {
         <input type="time" id="pe-pro-qh-end" value="${esc(qh.end || "08:00")}" ${dis}>
       </div></div>
       <div class="form-hint">静默时段内不会触发主动消息（支持跨午夜）</div>
-      <div class="form-group" style="padding:0 16px"><label style="display:block;font-size:13px;color:var(--text-2);margin:8px 0 4px">自定义提示词</label>
-        <textarea class="form-textarea" id="pe-pro-prompt" rows="3" placeholder="留空使用默认" ${dis}>${esc(pro.prompt || "")}</textarea>
+      <div class="prompt-field"><label class="prompt-label" for="pe-pro-prompt">自定义提示词</label>
+        <textarea class="prompt-input" id="pe-pro-prompt" rows="3" placeholder="留空使用默认" ${dis}>${esc(pro.prompt || "")}</textarea>
       </div>
     </div>`;
     })()}
@@ -774,16 +806,16 @@ async function renderPersonaEdit(data) {
 
     <div class="card">
       <div class="card-header">画面风格</div>
-      <div class="form-group" style="padding:0 16px 4px">
-        <textarea class="form-textarea" id="pe-img-art-style" rows="2" placeholder="例：anime style, masterpiece, best quality" ${fieldDisabled}>${esc(ig.art_style ?? "")}</textarea>
+      <div class="prompt-field">
+        <textarea class="prompt-input" id="pe-img-art-style" rows="2" placeholder="例：anime style, masterpiece, best quality" ${fieldDisabled}>${esc(ig.art_style ?? "")}</textarea>
       </div>
       <div class="form-hint">描述画风（动漫/写实/油画…），会拼到每次生图 prompt 最前。</div>
     </div>
 
     <div class="card">
       <div class="card-header">角色形象提示</div>
-      <div class="form-group" style="padding:0 16px 4px">
-        <textarea class="form-textarea" id="pe-img-style" rows="3" placeholder="例：1girl, silver hair, blue eyes, school uniform" ${fieldDisabled}>${esc(ig.style_prefix || "")}</textarea>
+      <div class="prompt-field">
+        <textarea class="prompt-input" id="pe-img-style" rows="3" placeholder="例：1girl, silver hair, blue eyes, school uniform" ${fieldDisabled}>${esc(ig.style_prefix || "")}</textarea>
       </div>
       <div class="form-hint">描述角色固定形象（发色/服饰/外貌特征），跟在画面风格之后，用于保持角色一致。</div>
     </div>
@@ -793,8 +825,8 @@ async function renderPersonaEdit(data) {
         <span class="card-header" style="flex:1;padding:0">负面提示词</span>
         <label class="switch-wrap"><input type="checkbox" id="pe-img-neg-en" ${ig.negative_enabled !== false ? "checked" : ""} ${fieldDisabled}><span class="switch-track"></span></label>
       </div>
-      <div class="form-group" style="padding:8px 16px 4px;border-top:none">
-        <textarea class="form-textarea" id="pe-img-neg" rows="3" placeholder="不希望出现的内容" ${fieldDisabled}>${esc(ig.negative_prompt ?? "")}</textarea>
+      <div class="prompt-field">
+        <textarea class="prompt-input" id="pe-img-neg" rows="3" placeholder="不希望出现的内容" ${fieldDisabled}>${esc(ig.negative_prompt ?? "")}</textarea>
       </div>
       <div class="form-hint">关闭开关后将不发送负面提示词，避免不支持的服务商被干扰。</div>
     </div>`;
@@ -815,9 +847,6 @@ async function renderPersonaEdit(data) {
         voiceCatalogFor(voicePresetVoices, currentModel, currentProv?.models),
       );
       return `
-    <div class="form-hint" style="background:var(--primary-light);color:var(--text-2);padding:10px 12px;margin:8px 16px 12px;border-radius:8px;line-height:1.6">
-      开启后该角色可以在合适的对话场景下（如"发个语音听听"、道晚安）在回复中用 [语音] 标记把想说的话合成为语音条发送。
-    </div>
     ${noProviders ? '<div class="form-hint" style="color:var(--danger,#d33);padding:0 16px 8px">尚未配置可用的语音服务商。请先到「设置 → 语音服务商」中添加；已启用的角色仍可在这里关闭语音。</div>' : ''}
 
     <div class="card">
@@ -825,16 +854,30 @@ async function renderPersonaEdit(data) {
       <div class="form-group"><div class="form-row"><label>启用语音消息</label>
         <label class="switch-wrap"><input type="checkbox" id="pe-voice-en" ${vg.enabled ? "checked" : ""} ${checkboxDisabled}><span class="switch-track"></span></label>
       </div></div>
+      <div class="form-group" id="pe-voice-trigger-controls">
+        <div class="form-group"><div class="form-row"><label for="pe-voice-trigger-mode">触发方式</label>
+          <select id="pe-voice-trigger-mode" ${fieldDisabled}>
+            <option value="ai" ${vg.trigger_mode !== "probability" ? "selected" : ""}>AI 自主决定（推荐）</option>
+            <option value="probability" ${vg.trigger_mode === "probability" ? "selected" : ""}>按概率触发</option>
+          </select>
+        </div></div>
+        <div class="form-group" id="pe-voice-probability-fields" ${vg.trigger_mode === "probability" ? "" : "hidden"}>
+          <div class="form-row"><label for="pe-voice-trigger-probability">触发概率</label>
+            <div class="slider-wrap"><input type="range" id="pe-voice-trigger-probability" min="0" max="100" step="1" value="${vg.trigger_probability ?? 50}" data-suffix="%" ${fieldDisabled}><span class="slider-val">${vg.trigger_probability ?? 50}%</span></div>
+          </div>
+        </div>
+      </div>
       <div class="form-group"><div class="form-row"><label>服务商</label>
         <select id="pe-voice-provider" onchange="PawzoChat.onPersonaVoiceProviderChange()" ${fieldDisabled}>${provOpts}</select>
       </div></div>
       <div class="form-group"><div class="form-row"><label>模型</label>
         <select id="pe-voice-model" onchange="PawzoChat.onPersonaVoiceModelChange()" ${fieldDisabled}>${modelOpts}</select>
       </div></div>
-      <div class="form-group"><div class="form-row"><label style="padding-right:12px">音色 (voice ID)</label>
-        <input id="pe-voice-voice" list="pe-voice-list" value="${esc(vg.voice || "")}" placeholder="留空则使用模型默认音色" spellcheck="false" autocomplete="off" ${fieldDisabled} style="flex:1;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1);text-align:right">
-      </div></div>
-      <datalist id="pe-voice-list">${voiceOpts}</datalist>
+      <div class="prompt-field voice-field"><label class="prompt-label" for="pe-voice-voice">音色 (voice ID)</label>
+        <input class="form-input" id="pe-voice-voice" list="pe-voice-list" value="${esc(vg.voice || "")}" placeholder="留空则使用模型默认音色" spellcheck="false" autocomplete="off" ${fieldDisabled}>
+        <datalist id="pe-voice-list">${voiceOpts}</datalist>
+        <div id="pe-account-voices" hidden></div>
+      </div>
       <div class="form-hint">音色 ID 可自由输入；预设列表随所选模型的音色体系变化。试听请前往「设置 → 语音服务商 → 语音测试」。</div>
       <div id="pe-voice-controls"></div>
     </div>`;
@@ -850,29 +893,93 @@ async function renderPersonaEdit(data) {
     </div>
     <div class="card">
       <div class="card-header">人设设定</div>
-      <textarea class="form-textarea prompt-part" id="pe-character" placeholder="描述角色的背景、性格、经历…">${esc(p.character_prompt)}</textarea>
+      <div class="prompt-field"><textarea class="prompt-input prompt-part" id="pe-character" placeholder="描述角色的背景、性格、经历…">${esc(p.character_prompt)}</textarea></div>
     </div>
     <div class="card">
       <div class="card-header">输出示例</div>
-      <textarea class="form-textarea prompt-part" id="pe-examples" placeholder="输入角色的经典台词作为风格参考…">${esc(p.output_examples)}</textarea>
+      <div class="prompt-field"><textarea class="prompt-input prompt-part" id="pe-examples" placeholder="输入角色的经典台词作为风格参考…">${esc(p.output_examples)}</textarea></div>
       <div class="form-hint">用于风格参考和输出格式对齐 建议填写以\\分割的多个示例 如：你好\\我是小明\\很高兴认识你</div>
     </div>
     <div class="card">
       <div class="card-header-row"><span class="card-header" style="flex:1">系统提示词</span><button class="btn-text btn-sm" onclick="PawzoChat.resetSystemInstructions()">恢复默认</button></div>
-      <textarea class="form-textarea prompt-part" id="pe-system" placeholder="输入系统级指令…">${esc(p.system_instructions)}</textarea>
+      <div class="prompt-field"><textarea class="prompt-input prompt-part" id="pe-system" placeholder="输入系统级指令…">${esc(p.system_instructions)}</textarea></div>
     </div>
     </div>
   </div>`;
 
   initPersonaVoiceControls(p.voice_generation, voiceProviders, voiceDefaults);
   _renderPeWorldbook();
+  $('pe-memory-sources')?.addEventListener('click', () => openPersonaMemorySources(p.id));
+  $('pe-mem-inc')?.addEventListener('change', updatePersonaMemorySourceSummary);
+  updatePersonaMemorySourceSummary();
+  refreshPersonaMemorySources(p.id);
+  $('pe-manage-memory')?.addEventListener('click', () => {
+    const fragment = document.createDocumentFragment();
+    const scroll = content().scrollTop;
+    while (content().firstChild) fragment.appendChild(content().firstChild);
+    data.memoryDraft = { fragment, scroll, avatar: _pendingAvatarBlob,
+      worldbooks: [..._peBoundWorldbooks], groupReads: { ..._peMemoryGroupReads }, memorySources: _peMemorySources };
+    pushPage('memoryManage', { personaId: p.id, personaName: p.name });
+  });
 
   if (isNew) {
     api.get("/api/personas/default-system-instructions").then(res => {
+      if (generation !== _personaEditGeneration) return;
       const ta = $("pe-system");
-      if (ta && !ta.value) ta.value = res.text || "";
+      if (ta && !ta.value) setPromptValue(ta, res.text || "");
     }).catch(() => {});
   }
+}
+
+function refreshPersonaMemorySources(personaId) {
+  const entry = $('pe-memory-sources');
+  const generation = _personaEditGeneration;
+  if (!entry) return;
+  api.get(`/api/personas/${encodeURIComponent(personaId)}/group-memories`, { bypassCache: true }).then(response => {
+    if (generation !== _personaEditGeneration || !entry.isConnected || $('pe-memory-sources') !== entry || response.error) return;
+    _peMemorySources = response.groups || [];
+    updatePersonaMemorySourceSummary();
+  }).catch(() => {});
+}
+
+function updatePersonaMemorySourceSummary() {
+  const summary = $('pe-memory-sources-summary');
+  const count = _peMemorySources.filter(group => Object.hasOwn(_peMemoryGroupReads, group.group_id)
+    ? _peMemoryGroupReads[group.group_id] : group.include_in_private !== false).length;
+  if (summary) summary.textContent = `已开启 ${count}/${_peMemorySources.length}`;
+  const hint = $('pe-memory-read-hint');
+  if (hint) hint.hidden = $('pe-mem-inc')?.checked !== false;
+}
+
+async function openPersonaMemorySources(personaId) {
+  const host = $('pe-memory-sources');
+  const generation = _personaEditGeneration;
+  if (!host) return;
+  host.disabled = true;
+  try {
+    const response = await api.get(`/api/personas/${encodeURIComponent(personaId)}/group-memories`, { bypassCache: true });
+    if (generation !== _personaEditGeneration || !host.isConnected) return;
+    if (response.error) throw new Error(response.error);
+    const groups = response.groups || [];
+    _peMemorySources = groups;
+    updatePersonaMemorySourceSummary();
+    showSheet(`<div class="memory-source-sheet">
+      <div class="sheet-title">私聊读取群记忆</div>
+      <p class="form-hint memory-source-intro">选择可在私聊中回忆的群聊经历。</p>
+      <div class="card memory-source-list">${groups.map(group => {
+        const status = group.status === 'deleted' ? ' · 已删除' : group.status === 'removed' ? ' · 已离群' : '';
+        const included = Object.hasOwn(_peMemoryGroupReads, group.group_id) ? _peMemoryGroupReads[group.group_id] : group.include_in_private !== false;
+        return `<label class="card-row memory-source-row"><span class="memory-source-name"><span>${esc(group.name || '群聊')}</span><small>${Number(group.total) || 0} 条记忆${status}</small></span><span class="switch-wrap"><input type="checkbox" data-memory-source="${escAttr(group.group_id)}" ${included ? 'checked' : ''} aria-label="读取${escAttr(group.name || '群聊')}的记忆"><span class="switch-track"></span></span></label>`;
+      }).join('') || '<div class="empty-state"><div class="empty-text">暂无群聊记忆</div></div>'}</div>
+      <p class="form-hint memory-source-footnote">更改随角色设置一起保存。${$('pe-mem-inc')?.checked === false || $('pe-mem-en')?.checked === false ? '当前私聊未启用读取，选择会保留。' : ''}</p>
+      <button type="button" class="sheet-cancel" onclick="PawzoChat.closeOverlay()">完成</button>
+    </div>`);
+    document.querySelectorAll('[data-memory-source]').forEach(input => input.addEventListener('change', () => {
+      _peMemoryGroupReads[input.dataset.memorySource] = input.checked;
+      updatePersonaMemorySourceSummary();
+    }));
+  } catch (error) { if (generation === _personaEditGeneration && host.isConnected) toast(error.message || '群聊记忆加载失败', 'error'); }
+  finally { host.disabled = false; }
 }
 
 function _renderPeWorldbook() {
@@ -1018,6 +1125,8 @@ export function switchPersonaEditTab(name) {
 }
 
 export async function savePersona(isNew) {
+  const generation = _personaEditGeneration;
+  const avatar = _pendingAvatarBlob;
   const name = $("pe-name").value.trim();
   if (!name) { toast("角色名称不能为空", "error"); return; }
   if (name.length > 100) { toast("角色名称过长（最多 100 个字符）", "error"); return; }
@@ -1043,6 +1152,7 @@ export async function savePersona(isNew) {
       include_in_prompt: $("pe-mem-inc").checked,
       trigger_rounds: parseInt($("pe-mem-trigger").textContent) || 0,
       trigger_mode: $("pe-mem-trigger-mode")?.value || "remind",
+      group_reads: { ..._peMemoryGroupReads },
     },
     bound_worldbooks: [..._peBoundWorldbooks],
   };
@@ -1085,12 +1195,12 @@ export async function savePersona(isNew) {
     if (isNew) {
       res = await api.post("/api/personas", body);
       if (res.status >= 400) { toast(res.data.error, "error"); return; }
-      if (_pendingAvatarBlob && res.data.id) {
+      if (avatar && res.data.id) {
         const fd = new FormData();
-        fd.append("avatar", _pendingAvatarBlob, "avatar.png");
+        fd.append("avatar", avatar, "avatar.png");
         const base = window.PAWZOCHAT_BASE || "";
         await fetch(`${base}/api/personas/${res.data.id}/avatar`, { method: "POST", body: fd });
-        _pendingAvatarBlob = null;
+        if (generation === _personaEditGeneration) _pendingAvatarBlob = null;
       }
     } else {
       const pid = $("pe-id").value.trim();
@@ -1098,7 +1208,7 @@ export async function savePersona(isNew) {
       if (res.status >= 400) { toast(res.data.error, "error"); return; }
     }
     toast("已保存", "success");
-    goBack();
+    if (generation === _personaEditGeneration) goBack();
     refreshSidebar();
   } catch (e) { toast("保存失败", "error"); }
   finally { hideLoading(); }
@@ -1108,7 +1218,7 @@ export async function resetSystemInstructions() {
   try {
     const res = await api.get("/api/personas/default-system-instructions");
     const ta = $("pe-system");
-    if (ta) ta.value = res.text || "";
+    setPromptValue(ta, res.text || "");
     toast("已恢复默认", "success");
   } catch (e) { toast("获取默认值失败", "error"); }
 }

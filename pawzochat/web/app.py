@@ -116,6 +116,11 @@ def create_app(app_instance: App) -> Flask:
     )
     flask_app.secret_key = os.urandom(32)
     flask_app.config["PAWZOCHAT_APP"] = app_instance
+    # Snapshot at service construction; request headers and later configuration
+    # edits must not redefine the local installation API's allowed origin.
+    flask_app.config["LOCAL_LISTEN_PORT"] = int(
+        app_instance.config.get("web", "port", default=62000)
+    )
     # Re-read templates from disk when they change — a long-running panel must
     # not keep serving a stale compiled page after the files under it were
     # replaced (dev edits, in-place file swaps).
@@ -140,6 +145,13 @@ def create_app(app_instance: App) -> Flask:
         if not is_public:
             return None
         if request.path in _AUTH_EXEMPT:
+            return None
+        if (
+            request.endpoint == "api_plugins.plugin_ui_token_asset"
+            and request.method in {"GET", "HEAD"}
+        ):
+            # Sandboxed UI subresources omit SameSite cookies. This exact
+            # read-only route validates its scoped, expiring token itself.
             return None
         if session.get("authenticated"):
             return None
@@ -255,6 +267,7 @@ def create_app(app_instance: App) -> Flask:
     # ---- Blueprints ----
 
     from pawzochat.web.routes.api_conversations import api_conversations_bp
+    from pawzochat.web.routes.api_groups import api_groups_bp
     from pawzochat.web.routes.api_personas import api_personas_bp
     from pawzochat.web.routes.api_memory import api_memory_bp
     from pawzochat.web.routes.api_settings import api_settings_bp
@@ -273,6 +286,7 @@ def create_app(app_instance: App) -> Flask:
     from pawzochat.web.routes.api_persona_writer import api_persona_writer_bp
 
     flask_app.register_blueprint(api_conversations_bp, url_prefix="/api/conversations")
+    flask_app.register_blueprint(api_groups_bp, url_prefix="/api/groups")
     flask_app.register_blueprint(api_personas_bp, url_prefix="/api/personas")
     flask_app.register_blueprint(api_memory_bp, url_prefix="/api/personas")
     flask_app.register_blueprint(api_settings_bp, url_prefix="/api/settings")
@@ -415,7 +429,8 @@ def create_app(app_instance: App) -> Flask:
 
     @flask_app.route("/api/events")
     def events():
-        return Response(sse_stream(), mimetype="text/event-stream")
+        is_public = bool(request.environ.get("pawzochat.is_public", False))
+        return Response(sse_stream(is_public=is_public), mimetype="text/event-stream")
 
     # ---- Update API ----
 

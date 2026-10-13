@@ -20,6 +20,7 @@ import { api, downloadFile } from "./api.js";
 import { $, content } from "./state.js";
 import { toast, confirm, showSheet, closeOverlay, showLoading, hideLoading } from "./ui.js";
 import { setTopBar, goBack, pushPage, registerPageRenderer } from "./navigation.js";
+import { resizePromptTextarea } from "./prompt_textarea.js";
 
 // Edit-page state. Populated by renderWorldbookEdit, read back by saveWorldbook.
 const _wb = {
@@ -132,7 +133,7 @@ export function wbExportCurrent() {
 }
 
 export function wbExportPick(name) {
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">导出「${esc(name)}」</div>
     <div class="card" style="margin:8px 0">
       <div class="card-row" style="cursor:pointer" onclick="PawzoChat._wbExportGo('${encodeURIComponent(name)}','pawzochat')">
@@ -148,7 +149,7 @@ export function wbExportPick(name) {
         </div><span class="row-arrow">›</span>
       </div>
     </div>
-    <button onclick="PawzoChat.closeOverlay()" style="width:100%;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
+    <button class="btn-secondary btn-block" onclick="PawzoChat.closeOverlay()">取消</button>
   </div>`);
 }
 
@@ -199,8 +200,8 @@ async function renderWorldbookEdit(data) {
   _wb.isNew = isNew;
   _wb.originalName = isNew ? "" : (data.name || "");
 
-  const exportBtn = isNew ? "" : `<button class="btn-text" onclick="PawzoChat.wbExportCurrent()" style="font-size:15px;font-weight:500;padding:8px 8px">导出</button>`;
-  const saveBtn = `<button class="btn-text" onclick="PawzoChat.wbSave()" style="font-size:15px;font-weight:500;padding:8px 8px">保存</button>`;
+  const exportBtn = isNew ? "" : `<button class="btn-text" onclick="PawzoChat.wbExportCurrent()">导出</button>`;
+  const saveBtn = `<button class="btn-text" onclick="PawzoChat.wbSave()">保存</button>`;
   setTopBar(isNew ? "新建世界书" : "编辑世界书", true, exportBtn + saveBtn);
 
   let book = { name: "", scope: { range: "selected", keyword_filter: false }, keywords: [], content: {}, bound_personas: [] };
@@ -270,9 +271,12 @@ async function renderWorldbookEdit(data) {
     <div class="card">
       <div class="card-header-row">
         <span class="card-header" style="flex:1">内容</span>
-        <button class="btn-text btn-sm" onclick="PawzoChat.wbAddSection()">+ 添加小节</button>
+        <button type="button" class="btn-text btn-sm" id="wb-add-first" onclick="PawzoChat.wbAddSection('start')">+ 添加小节</button>
       </div>
       <div id="wb-sections"></div>
+      <div class="wb-section-actions">
+        <button type="button" class="btn-text btn-sm" id="wb-add-last" onclick="PawzoChat.wbAddSection('end')">+ 添加小节</button>
+      </div>
     </div>
     ${!isNew ? `<div class="persona-actions mt-16">
       <button class="btn-text danger" onclick="PawzoChat.wbDeleteCurrent()">删除世界书</button>
@@ -324,7 +328,7 @@ export function wbPersonaPick() {
     showSheet(`<div style="padding:24px">
       <div class="sheet-title">选择角色</div>
       <div class="form-hint" style="text-align:center;padding:16px 0">还没有任何角色，请先在通讯录新建。</div>
-      <button onclick="PawzoChat.closeOverlay()" style="width:100%;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">关闭</button>
+      <button class="btn-secondary btn-block" onclick="PawzoChat.closeOverlay()">关闭</button>
     </div>`);
     return;
   }
@@ -338,12 +342,12 @@ export function wbPersonaPick() {
       </div>
     </label>`;
   }).join("");
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">选择角色</div>
     <div class="card" style="max-height:50vh;overflow:auto;margin:8px 0">${rowsHtml}</div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.wbPersonaPickConfirm()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">确定</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.wbPersonaPickConfirm()">确定</button>
     </div>
   </div>`);
 }
@@ -363,32 +367,46 @@ function wbPersonaRemove(id) {
 function _renderSections() {
   const host = $("wb-sections");
   if (!host) return;
-  host.innerHTML = _wb.sections.map((s, i) => {
-    const enabled = s.enabled !== false;
-    // Body (key input + textarea) dims when disabled to make the off-state
-    // obvious; the toggle itself stays at full opacity so it remains the
-    // clear interactive target. Editing is still allowed when off.
-    const bodyDim = enabled ? "" : "opacity:0.5";
-    return `
-    <div data-wb-section="${i}" style="padding:14px 16px 16px${i > 0 ? ";border-top:1px solid var(--border)" : ""}">
-      <div style="display:flex;align-items:center;gap:10px">
-        <input class="wb-sec-key" data-i="${i}" value="${esc(s.key)}" placeholder="小节名，例如：世界观" oninput="PawzoChat.wbSectionKeyChange(${i}, this.value)" style="flex:1;border:none;background:transparent;font-size:14px;font-weight:500;color:var(--text-1);padding:0;outline:none;font-family:var(--font);${bodyDim}">
-        <label class="switch-wrap" title="关闭后该小节不会注入到 AI 提示词" style="transform:scale(0.78);transform-origin:right center;margin-right:-4px">
-          <input type="checkbox" ${enabled ? "checked" : ""} onchange="PawzoChat.wbSectionToggle(${i}, this.checked)">
-          <span class="switch-track"></span>
-        </label>
-        <button class="btn-text btn-sm danger" onclick="PawzoChat.wbRemoveSection(${i})">删除</button>
-      </div>
-      <div style="height:1px;background:var(--divider);margin:10px 0"></div>
-      <textarea class="form-textarea wb-sec-val" data-i="${i}" rows="5" placeholder="小节内容" style="width:100%;border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);background:var(--bg);color:var(--text-1);resize:vertical;line-height:1.6;${bodyDim}"
-        oninput="PawzoChat.wbSectionValChange(${i}, this.value)">${esc(s.value)}</textarea>
-    </div>`;
-  }).join("");
+  host.innerHTML = _wb.sections.map(_sectionHtml).join("");
 }
 
-export function wbAddSection() {
-  _wb.sections.push({ key: "", value: "", enabled: true });
-  _renderSections();
+function _sectionHtml(s, i) {
+  const enabled = s.enabled !== false;
+  return `
+    <div class="wb-section${enabled ? "" : " wb-section-disabled"}" data-wb-section="${i}">
+      <div class="wb-section-header">
+        <input class="wb-sec-key" data-i="${i}" value="${esc(s.key)}" placeholder="小节名，例如：世界观" oninput="PawzoChat.wbSectionKeyChange(Number(this.dataset.i), this.value)">
+        <label class="switch-wrap" title="关闭后该小节不会注入到 AI 提示词">
+          <input type="checkbox" aria-label="启用小节" ${enabled ? "checked" : ""} onchange="PawzoChat.wbSectionToggle(Number(this.closest('.wb-section').dataset.wbSection), this.checked)">
+          <span class="switch-track"></span>
+        </label>
+        <button type="button" class="btn-text btn-sm danger" onclick="PawzoChat.wbRemoveSection(Number(this.closest('.wb-section').dataset.wbSection))">删除</button>
+      </div>
+      <textarea class="prompt-input wb-sec-val" data-i="${i}" rows="5" placeholder="小节内容"
+        oninput="PawzoChat.wbSectionValChange(Number(this.dataset.i), this.value)">${esc(s.value)}</textarea>
+    </div>`;
+}
+
+function _reindexSections() {
+  $("wb-sections").querySelectorAll('.wb-section').forEach((section, i) => {
+    section.dataset.wbSection = i;
+    section.querySelectorAll('[data-i]').forEach(input => { input.dataset.i = i; });
+  });
+}
+
+export function wbAddSection(position = 'start') {
+  const host = $("wb-sections");
+  if (!host) return;
+  const section = { key: "", value: "", enabled: true };
+  const atEnd = position === 'end';
+  if (atEnd) _wb.sections.push(section);
+  else _wb.sections.unshift(section);
+  host.insertAdjacentHTML(atEnd ? 'beforeend' : 'afterbegin', _sectionHtml(section, 0));
+  _reindexSections();
+  const added = atEnd ? host.lastElementChild : host.firstElementChild;
+  resizePromptTextarea(added.querySelector('textarea'));
+  added.scrollIntoView({ block: 'nearest' });
+  added.querySelector('.wb-sec-key').focus({ preventScroll: true });
 }
 
 export async function wbRemoveSection(i) {
@@ -400,12 +418,15 @@ export async function wbRemoveSection(i) {
     const ok = await confirm("删除小节", `确认删除「${label}」？此操作不可撤销。`, true);
     if (!ok) return;
   }
+  const element = $("wb-sections").children[i];
   if (_wb.sections.length <= 1) {
     _wb.sections[0] = { key: "", value: "", enabled: true };
+    element.outerHTML = _sectionHtml(_wb.sections[0], 0);
   } else {
     _wb.sections.splice(i, 1);
+    element.remove();
   }
-  _renderSections();
+  _reindexSections();
 }
 
 export function wbSectionKeyChange(i, val) {
@@ -420,10 +441,12 @@ export function wbSectionToggle(i, checked) {
   const s = _wb.sections[i];
   if (!s) return;
   s.enabled = !!checked;
-  // Re-render so the body dim updates immediately. The toggle keeps focus
-  // visually because we re-render the whole section list (cheap, < tens of
-  // sections in practice).
-  _renderSections();
+  // Keep the existing editors and their measured heights. Rebuilding the list
+  // temporarily collapses long prompts and moves the reader's scroll position.
+  const section = $("wb-sections")?.children[i];
+  if (!section) return;
+  section.querySelector('input[type="checkbox"]').checked = s.enabled;
+  section.classList.toggle('wb-section-disabled', !s.enabled);
 }
 
 /* ---- Save / Delete ---- */
@@ -514,7 +537,7 @@ export async function openWorldbookPicker(currentBound, onChange) {
     showSheet(`<div style="padding:24px">
       <div class="sheet-title">绑定世界书</div>
       <div class="form-hint" style="text-align:center;padding:16px 0">暂无可绑定的世界书。<br>全局世界书对所有角色自动生效，无需绑定。</div>
-      <button onclick="PawzoChat.closeOverlay()" style="width:100%;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">关闭</button>
+      <button class="btn-secondary btn-block" onclick="PawzoChat.closeOverlay()">关闭</button>
     </div>`);
     return;
   }
@@ -529,12 +552,12 @@ export async function openWorldbookPicker(currentBound, onChange) {
     </label>`).join("");
 
   window._wbPickerCallback = onChange;
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">绑定世界书</div>
     <div class="card" style="max-height:50vh;overflow:auto;margin:8px 0">${rowsHtml}</div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.wbPickerConfirm()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">确定</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.wbPickerConfirm()">确定</button>
     </div>
   </div>`);
 }

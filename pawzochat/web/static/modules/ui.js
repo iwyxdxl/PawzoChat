@@ -16,6 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 import { state, $ } from "./state.js";
+import { initPromptTextareas } from "./prompt_textarea.js";
+
+initPromptTextareas();
 
 let toastTimer = null;
 let overlayCloseTimer = null;
@@ -28,24 +31,58 @@ export function toast(msg, type = "info") {
   toastTimer = setTimeout(() => { el.className = "hide"; }, 3000);
 }
 
-export function confirm(title, desc, danger) {
+let confirmCloseTimer = null;
+
+function showConfirm(title, desc, danger, option, confirmText) {
   return new Promise(resolve => {
     const dlg = $("confirm-dialog");
+    clearTimeout(confirmCloseTimer);
+    dlg.querySelector(".dialog-option")?.remove();
     dlg.querySelector(".dialog-title").textContent = title;
     dlg.querySelector(".dialog-desc").textContent = desc;
+    let checkbox;
+    if (option) {
+      const label = document.createElement("label");
+      label.className = "dialog-option";
+      checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.setAttribute("aria-label", option.label);
+      checkbox.checked = false;
+      const copy = document.createElement("span");
+      copy.className = "dialog-option-copy";
+      const text = document.createElement("span");
+      text.textContent = option.label;
+      copy.append(text);
+      if (option.hint) {
+        const hint = document.createElement("small");
+        hint.textContent = option.hint;
+        copy.append(hint);
+      }
+      label.append(checkbox, copy);
+      dlg.querySelector(".dialog-desc").after(label);
+    }
     const ok = dlg.querySelector(".dialog-ok");
     ok.className = danger ? "dialog-ok danger" : "dialog-ok";
-    ok.textContent = danger ? "删除" : "确认";
+    ok.textContent = confirmText || (danger ? "删除" : "确认");
     dlg.classList.remove("hide");
     requestAnimationFrame(() => dlg.classList.add("show"));
-    state.confirmCb = resolve;
+    state.confirmCb = result => resolve({ confirmed: !!result, checked: !!checkbox?.checked });
   });
+}
+
+export async function confirm(title, desc, danger, confirmText) {
+  return (await showConfirm(title, desc, danger, undefined, confirmText)).confirmed;
+}
+
+export function confirmWithCheckbox(title, desc, danger, option) {
+  return showConfirm(title, desc, danger, option);
 }
 
 export function closeConfirm(result) {
   const dlg = $("confirm-dialog");
   dlg.classList.remove("show");
-  setTimeout(() => dlg.classList.add("hide"), 200);
+  clearTimeout(confirmCloseTimer);
+  confirmCloseTimer = setTimeout(() => dlg.classList.add("hide"), 200);
   if (state.confirmCb) { state.confirmCb(result); state.confirmCb = null; }
 }
 
@@ -59,6 +96,7 @@ export function showSheet(html, onClose, { dismissOverlay = true } = {}) {
   $("sheet-content").innerHTML = html;
   $("overlay").classList.remove("hide");
   $("action-sheet").classList.remove("hide");
+  $("action-sheet").scrollTop = 0;
   requestAnimationFrame(() => {
     $("overlay").classList.add("show");
     $("action-sheet").classList.add("show");

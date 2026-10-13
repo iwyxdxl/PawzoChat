@@ -34,6 +34,7 @@ import logging
 from pawzochat.voice.base import VoiceProvider
 from pawzochat.voice.settings import control_family
 from pawzochat.voice.providers.mimo_tts import MimoTTSProvider
+from pawzochat.voice.providers.elevenlabs_tts import ElevenLabsTTSProvider
 from pawzochat.voice.providers.minimaxi_tts import MiniMaxTTSProvider
 from pawzochat.voice.providers.openai_tts import OpenAITTSProvider
 from pawzochat.voice.providers.pawapi_tts import PawAPITTSProvider
@@ -41,6 +42,12 @@ from pawzochat.voice.providers.pawapi_tts import PawAPITTSProvider
 logger = logging.getLogger(__name__)
 
 VOICE_PROVIDER_PRESETS: dict[str, dict] = {
+    "elevenlabs": {
+        "name": "ElevenLabs", "default_name": "ElevenLabs",
+        "base_url": "https://api.elevenlabs.io",
+        "default_model_type": "elevenlabs_tts",
+        "endpoint_path": "/v1/text-to-speech/{voice_id}",
+    },
     "minimaxi": {
         "name": "MiniMax",
         "default_name": "MiniMax",
@@ -72,6 +79,7 @@ VOICE_PROVIDER_PRESETS: dict[str, dict] = {
 }
 
 VOICE_PRESET_MODELS: dict[str, list[dict]] = {
+    "elevenlabs": [{"id": "eleven_v4", "name": "Eleven v4", "type": "elevenlabs_tts"}],
     "minimaxi": [
         {"id": "speech-02-hd", "name": "Speech 02 HD", "type": "minimaxi_tts"},
         {"id": "speech-02-turbo", "name": "Speech 02 Turbo", "type": "minimaxi_tts"},
@@ -99,12 +107,15 @@ VOICE_PRESET_MODELS: dict[str, list[dict]] = {
 }
 
 VOICE_PROVIDER_CLASSES: dict[str, type[VoiceProvider]] = {
+    "elevenlabs_tts": ElevenLabsTTSProvider,
     "mimo_tts": MimoTTSProvider,
     "minimaxi_tts": MiniMaxTTSProvider,
     "openai_tts": OpenAITTSProvider,
 }
 
 MODEL_TYPE_OPTIONS: list[dict] = [
+    {"value": "elevenlabs_tts", "label": "ElevenLabs 原生（仅 Eleven v4）",
+     "endpoint_path": "/v1/text-to-speech/{voice_id}"},
     {
         "value": "minimaxi_tts",
         "label": "MiniMax 原生（/v1/t2a_v2）",
@@ -314,6 +325,7 @@ VOICE_CATALOGS: dict[str, list[dict]] = {
 
 # preset -> catalog. The vendor behind a preset decides which voice ids are valid.
 _PRESET_VOICE_CATALOGS: dict[str, str] = {
+    "elevenlabs": "elevenlabs",
     "minimaxi": "minimax",
     "pawapi": "minimax",
     "mimo": "mimo",
@@ -322,6 +334,7 @@ _PRESET_VOICE_CATALOGS: dict[str, str] = {
 
 # Fallback for "custom" relays, where the transport is the only vendor hint.
 _TYPE_VOICE_CATALOGS: dict[str, str] = {
+    "elevenlabs_tts": "elevenlabs",
     "minimaxi_tts": "minimax",
     "mimo_tts": "mimo",
     "openai_tts": "openai",

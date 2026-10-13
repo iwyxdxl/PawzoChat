@@ -80,6 +80,8 @@ class PersonaImportResult:
     reference_image_png: bytes | None = None
     warnings: list[str] = field(default_factory=list)
     embedded_book: dict | None = None
+    # Preserve intentionally blank prompts on PawzoChat exports.
+    has_system_instructions: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +441,7 @@ def card_to_persona(card: dict) -> PersonaImportResult:
         ("", description),
         ("性格", personality),
         ("背景", scenario),
-    )
+    ) if personality.strip() or scenario.strip() else description
 
     mes_example = str(data.get("mes_example") or "")
     system_instr = str(
@@ -476,7 +478,8 @@ def card_to_persona(card: dict) -> PersonaImportResult:
         pulled_in.append("负面提示词")
     reference_image_png = _extract_custom_reference_png(raw_image_generation, warnings)
     if reference_image_png is not None:
-        image_generation["ref_mode"] = "custom"
+        if "ref_mode" not in raw_image_generation:
+            image_generation["ref_mode"] = "custom"
         image_generation["custom_ref_filename"] = CUSTOM_REFERENCE_FILENAME
     if pulled_in:
         warnings.append(
@@ -502,6 +505,12 @@ def card_to_persona(card: dict) -> PersonaImportResult:
         voice_generation=normalize_voice_generation(pawzo_ext.get("voice_generation")),
         reference_image_png=reference_image_png,
         warnings=warnings,
+        # External ST cards use empty strings for unset prompt overrides.
+        # Only PawzoChat exports can deliberately opt out of our default.
+        has_system_instructions=bool(system_instr) or (
+            bool(pawzo_ext)
+            and ("system_prompt" in data or "post_history_instructions" in data)
+        ),
     )
 
     cb = data.get("character_book")
@@ -609,7 +618,6 @@ def persona_to_card(
     """
     image_generation = dict(persona.image_generation or {})
     if reference_image_png is not None:
-        image_generation["ref_mode"] = "custom"
         image_generation["custom_ref_filename"] = CUSTOM_REFERENCE_FILENAME
         image_generation["custom_ref_image_png_b64"] = base64.b64encode(reference_image_png).decode("ascii")
 
@@ -623,7 +631,8 @@ def persona_to_card(
         "emoji_enabled": persona.emoji_enabled,
         "emoji_send_probability": persona.emoji_send_probability,
         "emoji_group": persona.emoji_group,
-        "memory": persona.memory,
+        # Group IDs describe local memory archives, not portable role settings.
+        "memory": {key: value for key, value in persona.memory.items() if key != "group_reads"},
         "proactive": persona.proactive,
         "tool_policy": persona.tool_policy,
         "image_generation": image_generation,

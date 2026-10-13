@@ -20,10 +20,14 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import logging
 import re
 import sys
+import threading
 from dataclasses import dataclass
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +46,8 @@ from pawzochat.core.extensions.api import (
     PluginManifest,
 )
 from pawzochat.core.extensions.hooks import HookDispatcher, HookRegistrar
+from pawzochat.core.extensions.platforms import normalize_platforms, supports_platform
+from pawzochat.core.extensions.source import PluginError
 
 if TYPE_CHECKING:
     from pawzochat.app import App
@@ -64,6 +70,22 @@ KNOWN_PERMISSIONS = frozenset({
 _CONFIG_UI_DEFAULT_ENTRY = "index.html"
 
 
+class PluginBusyError(RuntimeError):
+    """Host callbacks are still running; leave plugin files untouched."""
+
+
+class PluginUnloadError(RuntimeError):
+    """Plugin resources could not be stopped safely."""
+
+
+def _managed(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 @dataclass
 class PluginRuntime:
     manifest: PluginManifest
@@ -76,12 +98,17 @@ class PluginRuntime:
     last_error: str = ""
     plugin: Plugin | None = None
     module_name: str = ""
+    platform_compatible: bool = True
+    platform_error: str = ""
 
 
 class ExtensionManager:
     """Loads and dispatches external plugins from the runtime plugins directory."""
 
     def __init__(self, app: App, config_manager, conversation_store, llm_manager, mcp_manager=None):
+        self._lock = threading.RLock()
+        self._recovery_required = ""
+        self._transaction_depth = 0
         self._app = app
         self._plugins_root = PLUGINS_DIR
         self._plugins: dict[str, PluginRuntime] = {}
@@ -92,6 +119,7 @@ class ExtensionManager:
         self._capability_registry: CapabilityAdapterRegistry | None = None
         self.hooks = HookDispatcher(self._on_hook_error)
 
+    @_managed
     def set_capability_registry(self, registry: CapabilityAdapterRegistry) -> None:
         """Inject the capability registry after construction.
 
@@ -105,12 +133,26 @@ class ExtensionManager:
     def start(self) -> None:
         self.refresh()
 
+    @_managed
     def stop(self) -> None:
-        for plugin_id in list(self._plugins):
-            self._unload_runtime(self._plugins[plugin_id], keep_status=False)
-        self._plugins.clear()
+        self._pause_all_plugin_calls()
+        try:
+            for plugin_id in list(self._plugins):
+                self._unload_runtime(self._plugins[plugin_id], keep_status=False)
+            self._plugins.clear()
+        finally:
+            self._resume_active_plugin_calls()
 
+    @_managed
     def refresh(self) -> None:
+        self._assert_management_available()
+        self._pause_all_plugin_calls()
+        try:
+            self._refresh_plugins()
+        finally:
+            self._resume_active_plugin_calls()
+
+    def _refresh_plugins(self) -> None:
         for plugin_id in list(self._plugins):
             self._unload_runtime(self._plugins[plugin_id], keep_status=False)
         self._plugins.clear()
@@ -144,6 +186,8 @@ class ExtensionManager:
 
         for plugin_id in ordered_plugin_ids:
             runtime = self._plugins[plugin_id]
+            if not runtime.platform_compatible:
+                continue
             if not runtime.enabled:
                 runtime.status = "disabled"
                 continue
@@ -169,6 +213,7 @@ class ExtensionManager:
                 continue
             self._load_runtime(runtime)
 
+    @_managed
     def list_plugins(self) -> list[dict]:
         return [
             self._runtime_summary(runtime)
@@ -178,6 +223,7 @@ class ExtensionManager:
             )
         ]
 
+    @_managed
     def get_plugin(self, plugin_id: str) -> dict | None:
         runtime = self._plugins.get(plugin_id)
         if not runtime:
@@ -196,32 +242,53 @@ class ExtensionManager:
             "permissions": list(runtime.manifest.permissions),
             "config_schema": copy.deepcopy(runtime.manifest.config_schema),
             "config_ui": copy.deepcopy(runtime.manifest.config_ui),
+            "platforms": list(runtime.manifest.platforms),
         }
         detail["settings"] = copy.deepcopy(runtime.settings)
         return detail
 
+    @_managed
     def set_enabled(self, plugin_id: str, enabled: bool) -> None:
+        self._assert_management_available()
         runtime = self._require_runtime(plugin_id)
+        if enabled:
+            # Re-read both author declarations before changing persistent
+            # settings, including plugins copied here from another system.
+            manifest = self._load_manifest(runtime.root_dir / PLUGIN_MANIFEST_FILE)
+            self._assert_platform_supported(manifest, runtime.root_dir)
         cfg = self._load_plugin_config(runtime.config_path)
         cfg["enabled"] = bool(enabled)
-        self._write_plugin_config(runtime.config_path, cfg)
-        self.refresh()
+        self._pause_all_plugin_calls()
+        try:
+            self._write_plugin_config(runtime.config_path, cfg)
+            self.refresh()
+        finally:
+            self._resume_active_plugin_calls()
 
+    @_managed
     def update_settings(self, plugin_id: str, settings: dict) -> dict:
+        self._assert_management_available()
         runtime = self._require_runtime(plugin_id)
         prepared = self._prepare_settings(runtime.manifest.config_schema, settings)
         cfg = self._load_plugin_config(runtime.config_path)
         cfg["settings"] = prepared
-        self._write_plugin_config(runtime.config_path, cfg)
-        self.refresh()
+        self._pause_all_plugin_calls()
+        try:
+            self._write_plugin_config(runtime.config_path, cfg)
+            self.refresh()
+        finally:
+            self._resume_active_plugin_calls()
         refreshed = self._require_runtime(plugin_id)
         return copy.deepcopy(refreshed.settings)
 
+    @_managed
     def reload_plugin(self, plugin_id: str) -> None:
+        self._assert_management_available()
         self._require_runtime(plugin_id)
         self.refresh()
         self._require_runtime(plugin_id)
 
+    @_managed
     def get_plugin_ui_root(self, plugin_id: str) -> Path | None:
         """Return the plugin's ``ui/`` directory if it declares ``config_ui``.
 
@@ -233,6 +300,143 @@ class ExtensionManager:
         if runtime is None or not runtime.manifest.config_ui:
             return None
         return runtime.root_dir / "ui"
+
+    @_managed
+    def get_plugin_root(self, plugin_id: str) -> Path | None:
+        """Return the discovered real root, independent of manifest ID."""
+        runtime = self._plugins.get(plugin_id)
+        return runtime.root_dir if runtime is not None else None
+
+    @_managed
+    def block_management(self, reason: str) -> None:
+        """Prevent refresh from loading an unresolved on-disk transaction."""
+        self._recovery_required = reason or "Plugin recovery required"
+
+    def _assert_management_available(self) -> None:
+        if self._recovery_required:
+            raise PluginUnloadError(self._recovery_required)
+
+    def _plugin_channel(self, plugin_id: str):
+        registry = getattr(self._app, "channel_registry", None)
+        return registry.get(f"plugin:{plugin_id}", default=None) if registry else None
+
+    def _resume_plugin_calls(self, plugin_id: str) -> None:
+        if self._transaction_depth or self._recovery_required:
+            return
+        self.hooks.resume_plugin(plugin_id)
+        if self._capability_registry is not None:
+            self._capability_registry.resume_owner(f"plugin:{plugin_id}")
+        channel = self._plugin_channel(plugin_id)
+        if channel is not None:
+            resumed = channel.resume_callbacks()
+            retry = getattr(self._app, "retry_deferred_accounts", None)
+            runtime = self._plugins.get(plugin_id)
+            if resumed and callable(retry) and runtime and runtime.status == "active":
+                try:
+                    retry(f"plugin:{plugin_id}")
+                except Exception:
+                    logger.exception("Unable to restart deferred plugin accounts: %s", plugin_id)
+
+    @contextmanager
+    def transaction(self):
+        """Freeze all host plugin callbacks until a directory transaction ends."""
+        with self._lock:
+            self._assert_management_available()
+            if self._transaction_depth == 0:
+                self._pause_all_plugin_calls()
+            self._transaction_depth += 1
+            try:
+                yield
+            finally:
+                self._transaction_depth -= 1
+                if not self._transaction_depth:
+                    self._resume_active_plugin_calls()
+
+    def _pause_plugin_calls(self, plugin_id: str) -> None:
+        # Reject immediately rather than wait while holding the manager lock:
+        # an in-flight callback may itself need that lock.
+        if not self.hooks.pause_plugin(plugin_id):
+            raise PluginBusyError(f"Plugin {plugin_id} has active hooks; retry later")
+        try:
+            if self._capability_registry is not None:
+                if not self._capability_registry.pause_owner(f"plugin:{plugin_id}"):
+                    raise PluginBusyError(f"Plugin {plugin_id} has active tools; retry later")
+            channel = self._plugin_channel(plugin_id)
+            if channel is not None and not channel.pause_callbacks():
+                raise PluginBusyError(f"Plugin {plugin_id} has active channel callbacks; retry later")
+        except Exception:
+            self._resume_plugin_calls(plugin_id)
+            raise
+
+    def _pause_all_plugin_calls(self) -> None:
+        paused = []
+        try:
+            for plugin_id in self._plugins:
+                self._pause_plugin_calls(plugin_id)
+                paused.append(plugin_id)
+        except Exception:
+            for plugin_id in paused:
+                self._resume_plugin_calls(plugin_id)
+            raise
+
+    def _resume_active_plugin_calls(self) -> None:
+        for plugin_id, runtime in self._plugins.items():
+            if runtime.status == "active":
+                self._resume_plugin_calls(plugin_id)
+
+    @_managed
+    def unload_plugin(self, plugin_id: str, *, root_dir: Path | None = None) -> None:
+        """Stop one plugin before replacement, including failed-load modules.
+
+        Busy callbacks and failed teardown raise before the caller may rename
+        any directory. A failed runtime is retained so cleanup can be retried.
+        """
+        runtime = self._plugins.get(plugin_id)
+        if runtime is not None:
+            self._unload_runtime(runtime, keep_status=False)
+            self._plugins.pop(plugin_id, None)
+            return
+        self._pause_plugin_calls(plugin_id)
+        try:
+            self.hooks.unregister_plugin(plugin_id)
+            self._unregister_plugin_tools(plugin_id)
+            self._unregister_plugin_channel(plugin_id)
+        finally:
+            sys.modules.pop(f"pawzochat_plugin_{plugin_id}", None)
+            if root_dir is not None:
+                self._clear_plugin_modules(root_dir)
+
+    @staticmethod
+    def _clear_plugin_modules(root_dir: Path) -> None:
+        root = Path(root_dir).resolve()
+
+        def belongs_to_plugin(path) -> bool:
+            try:
+                Path(path).resolve().relative_to(root)
+                return True
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return False
+
+        stale = {}
+        for name, module in list(sys.modules.items()):
+            filename = getattr(module, "__file__", None)
+            # Namespace packages have no __file__. Keep a shared namespace
+            # when another directory also contributes to it, but remove a
+            # namespace belonging entirely to this plugin.
+            locations = tuple(getattr(module, "__path__", ())) if not filename else ()
+            if ((filename and belongs_to_plugin(filename))
+                    or (locations and all(belongs_to_plugin(path) for path in locations))):
+                stale[name] = module
+        for name, module in stale.items():
+            if sys.modules.get(name) is module:
+                sys.modules.pop(name, None)
+            # `from package import child` can reuse this attribute without
+            # consulting sys.modules, including on a shared namespace package.
+            parent_name, _, child_name = name.rpartition(".")
+            parent = sys.modules.get(parent_name)
+            if parent is not None and vars(parent).get(child_name) is module:
+                delattr(parent, child_name)
+        importlib.invalidate_caches()
 
     def dispatch_message_received(self, event) -> None:
         self.hooks.dispatch_message_received(event)
@@ -270,7 +474,7 @@ class ExtensionManager:
         state_dir = root_dir / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
 
-        return PluginRuntime(
+        runtime = PluginRuntime(
             manifest=manifest,
             root_dir=root_dir,
             config_path=config_path,
@@ -279,10 +483,55 @@ class ExtensionManager:
             settings=settings,
             status="discovered",
         )
+        self._apply_platform_guard(runtime)
+        return runtime
+
+    @staticmethod
+    def _assert_platform_supported(manifest: PluginManifest, root_dir: Path) -> None:
+        """Require both the package and persisted index to allow this OS.
+
+        Missing declarations retain legacy behavior. An unreadable or malformed
+        install record must never silently remove a previously saved restriction.
+        """
+        record_path = root_dir / ".install.json"
+        installed_platforms = ()
+        if record_path.exists() or record_path.is_symlink():
+            try:
+                if (record_path.is_symlink() or not record_path.is_file()
+                        or record_path.stat().st_size > 1024 * 1024):
+                    raise ValueError("Invalid install metadata file")
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("Install metadata must be an object")
+                if "platforms" in record:
+                    installed_platforms = normalize_platforms(record["platforms"])
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise PluginError("platform_invalid", "插件平台信息无效，请重新安装") from exc
+        if not supports_platform(manifest.platforms) or not supports_platform(installed_platforms):
+            raise PluginError("platform_unsupported", "此插件不支持当前系统", 409)
+
+    def _apply_platform_guard(self, runtime: PluginRuntime) -> bool:
+        try:
+            self._assert_platform_supported(runtime.manifest, runtime.root_dir)
+        except PluginError as exc:
+            runtime.platform_compatible = False
+            runtime.platform_error = exc.code
+            runtime.enabled = False
+            runtime.status = "unsupported"
+            runtime.last_error = exc.message
+            return False
+        runtime.platform_compatible = True
+        runtime.platform_error = ""
+        return True
 
     def _load_runtime(self, runtime: PluginRuntime) -> None:
+        # The guard also belongs at the import boundary: disabled or unsupported
+        # plugins must never execute their module-level code.
+        if not self._apply_platform_guard(runtime):
+            return
         module_name = ""
         try:
+            self._pause_plugin_calls(runtime.manifest.id)
             module_part, sep, attr = runtime.manifest.entrypoint.partition(":")
             if not sep or not module_part or not attr:
                 raise ValueError("entrypoint must be in 'module:function' format")
@@ -292,6 +541,7 @@ class ExtensionManager:
                 raise FileNotFoundError(f"Entrypoint module not found: {module_path}")
 
             module_name = f"pawzochat_plugin_{runtime.manifest.id}"
+            runtime.module_name = module_name
             spec = importlib.util.spec_from_file_location(module_name, module_path)
             if spec is None or spec.loader is None:
                 raise ImportError(f"Unable to load module spec: {module_path}")
@@ -331,23 +581,23 @@ class ExtensionManager:
                 ),
                 channels=ChannelsFacade(self._app, runtime.manifest),
             )
+            runtime.plugin = plugin
             plugin.setup(ctx)
 
-            runtime.plugin = plugin
             runtime.module_name = module_name
             runtime.status = "active"
             runtime.last_error = ""
+            self._resume_plugin_calls(runtime.manifest.id)
         except Exception as exc:
-            self.hooks.unregister_plugin(runtime.manifest.id)
-            self._unregister_plugin_tools(runtime.manifest.id)
-            self._unregister_plugin_channel(runtime.manifest.id)
+            cleanup_error = ""
+            try:
+                self._unload_runtime(runtime, keep_status=True)
+            except Exception as cleanup_exc:
+                cleanup_error = f"; cleanup failed: {cleanup_exc}"
+                logger.exception("Failed to clean up plugin setup: %s", runtime.manifest.id)
             runtime.status = "broken"
-            runtime.last_error = str(exc)
+            runtime.last_error = f"{exc}{cleanup_error}"
             logger.exception("Failed to load plugin: %s", runtime.manifest.id)
-            if module_name:
-                sys.modules.pop(module_name, None)
-            runtime.plugin = None
-            runtime.module_name = ""
 
     def _unload_runtime(
         self,
@@ -355,21 +605,38 @@ class ExtensionManager:
         *,
         keep_status: bool,
     ) -> None:
+        self._pause_plugin_calls(runtime.manifest.id)
         self.hooks.unregister_plugin(runtime.manifest.id)
-        if runtime.plugin is not None:
+        errors = []
+        try:
+            if runtime.plugin is not None:
+                try:
+                    runtime.plugin.teardown()
+                except Exception as exc:
+                    errors.append(exc)
+                    logger.exception("Failed to teardown plugin: %s", runtime.manifest.id)
+            for cleanup in (self._unregister_plugin_tools, self._unregister_plugin_channel):
+                try:
+                    cleanup(runtime.manifest.id)
+                except Exception as exc:
+                    errors.append(exc)
+                    logger.exception("Failed to unregister plugin resources: %s", runtime.manifest.id)
+        finally:
+            self.hooks.unregister_plugin(runtime.manifest.id)
+            if runtime.module_name:
+                sys.modules.pop(runtime.module_name, None)
+            runtime.module_name = ""
             try:
-                runtime.plugin.teardown()
-            except Exception:
-                logger.exception("Failed to teardown plugin: %s", runtime.manifest.id)
-        # Always strip registered tools after teardown — even if teardown
-        # raised, we don't want stale entries pointing into an unloaded
-        # module.
-        self._unregister_plugin_tools(runtime.manifest.id)
-        self._unregister_plugin_channel(runtime.manifest.id)
-        if runtime.module_name:
-            sys.modules.pop(runtime.module_name, None)
+                self._clear_plugin_modules(runtime.root_dir)
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            # Keep the instance to allow idempotent teardown to be retried;
+            # never claim an unsafe runtime was fully stopped.
+            runtime.status = "broken"
+            runtime.last_error = "; ".join(str(exc) for exc in errors)
+            raise PluginUnloadError(f"Plugin {runtime.manifest.id} cleanup failed: {runtime.last_error}") from errors[0]
         runtime.plugin = None
-        runtime.module_name = ""
         if not keep_status:
             runtime.status = "discovered"
             runtime.last_error = ""
@@ -381,13 +648,10 @@ class ExtensionManager:
         load-error path.
         """
         channel_type = f"plugin:{plugin_id}"
-        channel = self._app.channel_registry.get(channel_type, default=None)
+        channel = self._plugin_channel(plugin_id)
         if channel is None:
             return
-        try:
-            channel.shutdown()
-        except Exception:
-            logger.exception("停止插件通道账号失败: %s", channel_type)
+        channel.shutdown(strict=True)
         self._app.channel_registry.unregister(channel_type)
 
     def _unregister_plugin_tools(self, plugin_id: str) -> None:
@@ -398,21 +662,16 @@ class ExtensionManager:
         """
         if self._capability_registry is None:
             return
-        try:
-            removed = self._capability_registry.unregister_owner(
-                f"plugin:{plugin_id}"
-            )
-        except Exception:
-            logger.exception(
-                "Failed to unregister plugin tools for %s", plugin_id,
-            )
-            return
+        removed = self._capability_registry.unregister_owner(
+            f"plugin:{plugin_id}"
+        )
         if removed:
             logger.info(
                 "Unregistered %d tool(s) from plugin %s: %s",
                 len(removed), plugin_id, ", ".join(sorted(removed)),
             )
 
+    @_managed
     def get_provided_tools(self, plugin_id: str) -> list[dict]:
         """Return the tools registered by ``plugin_id`` via ctx.mcp.register_tool.
 
@@ -442,6 +701,8 @@ class ExtensionManager:
             "description": runtime.manifest.description,
             "author": runtime.manifest.author,
             "enabled": runtime.enabled,
+            "platform_compatible": runtime.platform_compatible,
+            "platform_error": runtime.platform_error,
             "status": runtime.status,
             "last_error": runtime.last_error,
             "hooks": list(runtime.manifest.hooks),
@@ -485,6 +746,10 @@ class ExtensionManager:
             )
 
         config_ui = self._normalize_config_ui(raw.get("config_ui"), plugin_id)
+        try:
+            platforms = normalize_platforms(raw["platforms"]) if "platforms" in raw else ()
+        except ValueError as exc:
+            raise PluginError("platform_invalid", "插件平台信息无效，请重新安装") from exc
 
         return PluginManifest(
             id=plugin_id,
@@ -499,6 +764,7 @@ class ExtensionManager:
             permissions=permissions,
             config_schema=copy.deepcopy(raw.get("config_schema", {}) or {}),
             config_ui=config_ui,
+            platforms=platforms,
         )
 
     @staticmethod
@@ -656,6 +922,7 @@ class ExtensionManager:
         cyclic = all_ids - set(order)
         return order, cyclic
 
+    @_managed
     def _on_hook_error(self, plugin_id: str, hook_name: str, exc: BaseException) -> None:
         runtime = self._plugins.get(plugin_id)
         if runtime:

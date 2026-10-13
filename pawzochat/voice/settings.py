@@ -23,10 +23,12 @@ import re
 
 VOICE_GENERATION_DEFAULTS = {
     "enabled": False, "provider": "", "model": "", "voice": "", "speed": 1.0,
+    "trigger_mode": "ai", "trigger_probability": 50,
     "emotion_enabled": False, "emotion": "",
     "minimax": {"interjections_enabled": False, "pause_enabled": False,
                 "language_boost": "", "volume": 1.0, "pitch": 0},
     "mimo": {"dialect": "auto", "speaking_rate": "auto", "style_instruction": ""},
+    "elevenlabs": {"stability": 0.5, "similarity_boost": 0.75, "audio_tags_enabled": False},
 }
 INTERJECTIONS = tuple(f"({tag})" for tag in (
     "laughs", "chuckle", "coughs", "clear-throat", "groans", "breath", "pant",
@@ -39,6 +41,8 @@ _PAUSE_TAG_RE = re.compile(r"<#[+-]?(?:\d+(?:\.\d*)?|\.\d+)#>")
 _EMOTION_TAG_RE = re.compile(r"\[(?:happy|sad|angry|fearful|disgusted|surprised|neutral|calm|fluent|whisper)\]", re.I)
 EMOTIONS = {"": "自动", "happy": "高兴", "sad": "悲伤", "angry": "愤怒", "fearful": "害怕",
             "disgusted": "厌恶", "surprised": "惊讶", "calm": "平静"}
+ELEVENLABS_AUDIO_TAGS = ("laughs", "chuckles", "sighs", "exhales", "clears throat", "whispers", "shouts")
+_ELEVENLABS_AUDIO_TAG_RE = re.compile(r"\[(?:" + "|".join(re.escape(t) for t in ELEVENLABS_AUDIO_TAGS) + r")\]", re.I)
 LANGUAGES = {
     'Chinese': '中文（普通话）',
     'Chinese,Yue': '中文（粤语）',
@@ -89,12 +93,20 @@ def control_family(provider_cfg: dict, model_entry: dict) -> str:
     preset = provider_cfg.get("preset")
     if preset in ("minimaxi", "pawapi"):
         return "minimax"
+    if preset == "elevenlabs":
+        return "elevenlabs"
     if preset == "mimo":
         return "mimo"
-    return {"minimaxi_tts": "minimax", "mimo_tts": "mimo"}.get(model_entry.get("type"), "openai")
+    return {"minimaxi_tts": "minimax", "mimo_tts": "mimo", "elevenlabs_tts": "elevenlabs"}.get(model_entry.get("type"), "openai")
 
 
 def control_description(family: str) -> dict:
+    if family == "elevenlabs":
+        return {"family": family, "stability": {"min": 0, "max": 1, "step": 0.01},
+                "similarity_boost": {"min": 0, "max": 1, "step": 0.01},
+                "emotions": EMOTIONS,
+                "emotion_hint": "通过音频标签引导整条语音的情绪。",
+                "audio_tags_hint": "允许 AI 按语境添加笑声、叹气、耳语等标签。"}
     common = {"family": family, "speed": {"min": 0.5, "max": 2, "step": 0.1}}
     if family == "minimax":
         return {**common, "languages": {"": "跟随音色", "auto": "自动判断", **LANGUAGES},
@@ -124,6 +136,11 @@ def normalize_voice_generation(raw) -> dict:
     for key in ("provider", "model", "voice"):
         out[key] = str(raw.get(key) or "").strip()
     out["enabled"] = bool(raw.get("enabled", False))
+    out["trigger_mode"] = "probability" if raw.get("trigger_mode") == "probability" else "ai"
+    probability = raw.get("trigger_probability")
+    out["trigger_probability"] = int(_number(
+        probability if not isinstance(probability, bool) else None, 50, 0, 100,
+    ))
     out["speed"] = _number(raw.get("speed"), 1.0, 0.25, 4)
     out["emotion_enabled"] = raw.get("emotion_enabled") is True
     emotion = raw.get("emotion", "")
@@ -143,6 +160,12 @@ def normalize_voice_generation(raw) -> dict:
         "speaking_rate": mi.get("speaking_rate") if isinstance(mi.get("speaking_rate"), str) and mi["speaking_rate"] in RATES else "auto",
         "style_instruction": str(mi.get("style_instruction") or ""),
     }
+    el = raw.get("elevenlabs") if isinstance(raw.get("elevenlabs"), dict) else {}
+    out["elevenlabs"] = {
+        "stability": _number(el.get("stability"), 0.5, 0, 1),
+        "similarity_boost": _number(el.get("similarity_boost"), 0.75, 0, 1),
+        "audio_tags_enabled": el.get("audio_tags_enabled") is True,
+    }
     return out
 
 
@@ -152,7 +175,7 @@ def merge_voice_generation(current, patch):
         return patch
     for key in VOICE_GENERATION_DEFAULTS:
         if key in patch:
-            if key in ("minimax", "mimo") and isinstance(patch[key], dict):
+            if key in ("minimax", "mimo", "elevenlabs") and isinstance(patch[key], dict):
                 out[key].update(patch[key])
             else:
                 out[key] = patch[key]
@@ -163,6 +186,13 @@ def validate_voice_generation(raw) -> str | None:
     """Validate explicit API values before tolerant on-disk normalization."""
     if not isinstance(raw, dict):
         return "voice_generation 必须为对象"
+    if "trigger_mode" in raw and raw["trigger_mode"] not in ("ai", "probability"):
+        return "trigger_mode 必须为 ai 或 probability"
+    if "trigger_probability" in raw and (
+        type(raw["trigger_probability"]) is not int
+        or not 0 <= raw["trigger_probability"] <= 100
+    ):
+        return "trigger_probability 必须为 0–100 的整数"
     for key in ("enabled", "emotion_enabled"):
         if key in raw and not isinstance(raw[key], bool):
             return f"{key} 必须为布尔值"
@@ -171,10 +201,13 @@ def validate_voice_generation(raw) -> str | None:
             return f"{key} 必须为文本"
     if raw.get("emotion", "") not in (*EMOTIONS, "neutral"):
         return "emotion 不在支持的情绪列表中"
-    for key in ("minimax", "mimo"):
+    for key in ("minimax", "mimo", "elevenlabs"):
         if key in raw and not isinstance(raw[key], dict):
             return f"{key} 必须为对象"
     mm, mi = raw.get("minimax", {}), raw.get("mimo", {})
+    el = raw.get("elevenlabs", {})
+    if "audio_tags_enabled" in el and not isinstance(el["audio_tags_enabled"], bool):
+        return "elevenlabs.audio_tags_enabled 必须为布尔值"
     for key in ("interjections_enabled", "pause_enabled"):
         if key in mm and not isinstance(mm[key], bool):
             return f"minimax.{key} 必须为布尔值"
@@ -184,7 +217,8 @@ def validate_voice_generation(raw) -> str | None:
             return f"{path}.{key} 不在支持的选项中"
     if "style_instruction" in mi and (not isinstance(mi["style_instruction"], str) or len(mi["style_instruction"]) > 4000):
         return "mimo.style_instruction 必须为不超过 4000 字符的文本"
-    for values, key, lo, hi, integral in ((raw, "speed", 0.25, 4, False), (mm, "volume", 0, 10, False), (mm, "pitch", -12, 12, True)):
+    for values, key, lo, hi, integral in ((raw, "speed", 0.25, 4, False), (mm, "volume", 0, 10, False), (mm, "pitch", -12, 12, True),
+                                          (el, "stability", 0, 1, False), (el, "similarity_boost", 0, 1, False)):
         if key not in values:
             continue
         try:
@@ -204,8 +238,29 @@ def strip_pause_tags(text: str) -> str:
     return _PAUSE_TAG_RE.sub("", text)
 
 
-def clean_fallback_text(text: str) -> str:
-    return _EMOTION_TAG_RE.sub("", strip_pause_tags(strip_interjections(text)))
+def clean_fallback_text(text: str, *, preserve_boundaries: bool = False) -> str:
+    # Group mentions must remain recognizable after voice controls disappear:
+    # @name(laughs)hello should not turn into the different name @namehello.
+    replacement = " " if preserve_boundaries else ""
+    for pattern in (_INTERJECTION_RE, _PAUSE_TAG_RE, _EMOTION_TAG_RE, _ELEVENLABS_AUDIO_TAG_RE):
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def strip_elevenlabs_audio_tags(text: str) -> str:
+    return _ELEVENLABS_AUDIO_TAG_RE.sub(" ", text)
+
+
+def prepare_elevenlabs_text(text: str, settings: dict, emotion: str = "") -> str:
+    # Spaces retain word and mention boundaries when a control disappears.
+    text = _INTERJECTION_RE.sub(" ", _PAUSE_TAG_RE.sub(" ", text))
+    if not settings["elevenlabs"]["audio_tags_enabled"]:
+        text = strip_elevenlabs_audio_tags(text)
+    if not settings["emotion_enabled"]:
+        text = _EMOTION_TAG_RE.sub(" ", text)
+    if not clean_fallback_text(text).strip():
+        return ""
+    return f"[{emotion}] {text}" if emotion else text
 
 
 def effective_emotion(settings: dict, emotion: str = "") -> str:
@@ -255,7 +310,17 @@ def voice_guidance(settings: dict, family: str, voice: str = "") -> str:
             "不必每条语音都添加，也不要连续堆叠标签或为展示效果而遍历标签。咳嗽、喘气、打嗝等声音只在语境确实需要时使用，"
             "避免无缘由地改变角色当时的状态。"
         )
-    if family in ("minimax", "mimo") and settings["emotion_enabled"]:
+    if family == "elevenlabs" and settings["elevenlabs"]["audio_tags_enabled"]:
+        sections.append(
+            "【声音与语气标签】\n"
+            "仅在语音正文中，按角色性格和语境少量使用以下英文方括号标签："
+            "[laughs] 笑声、[chuckles] 轻笑、[sighs] 叹气、[exhales] 呼气、"
+            "[clears throat] 清嗓、[whispers] 耳语、[shouts] 大声说话。\n"
+            "例如：[语音][chuckles]这都被你发现了。"
+            "标签放在声音发生的位置，不要朗读标签或添加动作旁白；不要创造其他标签或堆叠标签。"
+            "这些标签只控制局部声音和说话方式，不替代整条语音的情绪标记。"
+        )
+    if family in ("minimax", "mimo", "elevenlabs") and settings["emotion_enabled"]:
         sections.append(
             "【单条语音的情绪】\n"
             "在情绪特别强烈、确有必要明确表达基调时，可以把语音开头的标记写成 [语音-情绪值]，"

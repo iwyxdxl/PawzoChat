@@ -22,6 +22,7 @@ export const state = {
   sidebarScrollPos: {},
   personas: [],
   conversations: [],
+  groups: [],
   confirmCb: null,
   sseSource: null,
   processingPersonas: new Set(),

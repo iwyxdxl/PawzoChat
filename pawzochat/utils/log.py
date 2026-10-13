@@ -89,6 +89,10 @@ def setup_logging(level: int = logging.INFO):
     root = logging.getLogger()
     root.setLevel(level)
 
+    # Keep routine HTTP requests and connection activity out of application logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     if root.handlers:
         return
 

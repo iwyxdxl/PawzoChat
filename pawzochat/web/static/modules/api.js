@@ -121,8 +121,13 @@ export const api = {
     });
     return { status: r.status, data: await r.json() };
   },
-  async del(url) {
-    const r = await fetch(BASE + url, { method: "DELETE" });
+  async del(url, body) {
+    const options = { method: "DELETE" };
+    if (body !== undefined) {
+      options.headers = { "Content-Type": "application/json" };
+      options.body = JSON.stringify(body);
+    }
+    const r = await fetch(BASE + url, options);
     return { status: r.status, data: await r.json() };
   },
   // String → exact key. RegExp / function → predicate over cached keys.

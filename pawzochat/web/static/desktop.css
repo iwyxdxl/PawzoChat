@@ -84,7 +84,7 @@
     background: var(--primary-light);
   }
   #sidebar-tabs .tab:hover:not(.active) {
-    background: rgba(176, 137, 104, 0.06);
+    background: var(--bg-hover);
   }
 
   /* ---- Sidebar header ---- */
@@ -181,9 +181,9 @@
   /* ================================================================
    * Hover effects (desktop pointer)
    * ================================================================ */
-  .conv-item:hover { background: rgba(176, 137, 104, 0.06); }
-  .card-row:hover { background: rgba(176, 137, 104, 0.06); }
-  .sheet-item:hover:not(.disabled) { background: rgba(176, 137, 104, 0.06); }
+  .conv-item:hover { background: var(--bg-hover); }
+  .card-row:hover { background: var(--bg-hover); }
+  .sheet-item:hover:not(.disabled) { background: var(--bg-hover); }
   .emoji-thumb:hover { background: var(--divider); }
   .top-btn:hover { background: var(--primary-light); }
 

@@ -18,6 +18,7 @@
 import { state, $, content, sidebar, topTitle, topBack, topActions } from "./state.js";
 
 const tabRenderers = {};
+const tabRestoreHandlers = {};
 const pageRenderers = {};
 let pageCleanup = null;
 
@@ -29,8 +30,9 @@ function disposePage() {
   cleanup?.();
 }
 
-export function registerTabRenderer(tab, fn) {
+export function registerTabRenderer(tab, fn, onRestore) {
   tabRenderers[tab] = fn;
+  tabRestoreHandlers[tab] = onRestore;
 }
 
 export function registerPageRenderer(page, fn) {
@@ -202,6 +204,7 @@ function _restoreTabDom(tab) {
   container.appendChild(entry.fragment);
   _restoreChrome(entry.chrome);
   _tabCache.delete(tab);
+  tabRestoreHandlers[tab]?.();
   // Scroll restoration must wait for the freshly-attached subtree to lay out.
   requestAnimationFrame(() => { container.scrollTop = entry.scroll; });
   return true;
@@ -218,11 +221,14 @@ window.addEventListener("pawzo:api-invalidated", () => {
 
 /* ---- Core navigation ---- */
 
-export function switchTab(tab) {
+export function switchTab(tab, { refresh = false } = {}) {
   disposePage();
+  // A workflow such as quick setup can change data behind the visible tab.
+  // Do not snapshot and immediately restore that stale DOM on a forced refresh.
+  if (refresh) _tabCache.delete(tab);
   if (isDesktop()) {
     state.sidebarScrollPos[state.currentTab] = sidebar()?.scrollTop || 0;
-    _saveTabDom(state.currentTab);
+    if (!refresh || state.currentTab !== tab) _saveTabDom(state.currentTab);
     state.currentTab = tab;
     state.pageStack = [];
     document.querySelectorAll(".tab").forEach(t =>
@@ -239,7 +245,7 @@ export function switchTab(tab) {
     showDesktopWelcome();
   } else {
     state.tabScrollPos[state.currentTab] = content().scrollTop;
-    _saveTabDom(state.currentTab);
+    if (!refresh || state.currentTab !== tab) _saveTabDom(state.currentTab);
     state.currentTab = tab;
     state.pageStack = [];
     document.querySelectorAll(".tab").forEach(t =>

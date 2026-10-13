@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pawzochat.paths import CHATS_DIR
@@ -47,8 +48,15 @@ def synthesize_voice_clip(
     settings: dict,
     text: str,
     emotion: str = "",
+    media_dir: Path | None = None,
+    preserve_boundaries: bool = False,
 ) -> dict | None:
-    """Synthesize one voice clip and persist it under ``data/chats/<persona_id>/voice/``.
+    """Synthesize one clip into the private chat or a host-owned media root.
+
+    ``media_dir`` overrides ``data/chats/<persona_id>`` for group staging;
+    it never changes which persona's voice settings are used.
+    ``preserve_boundaries`` keeps spaces where voice controls are removed
+    from the transcript, so group mention names cannot merge with text.
 
     ``settings`` is the product of ``normalize_voice_generation``; the caller
     must have passed the availability gate already (enabled + resolvable
@@ -72,7 +80,7 @@ def synthesize_voice_clip(
     audio_bytes = response.audio_data
     duration_ms = probe_mp3_duration_ms(audio_bytes)
 
-    out_dir = CHATS_DIR / persona_id / "voice"
+    out_dir = (Path(media_dir) if media_dir is not None else CHATS_DIR / persona_id) / "voice"
     out_path = out_dir / f"tts_{secrets.token_hex(8)}.{response.format or 'mp3'}"
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -93,5 +101,5 @@ def synthesize_voice_clip(
         "path": str(out_path),
         "mime": response.mime_type or "audio/mpeg",
         "duration_ms": duration_ms,
-        "text": clean_fallback_text(text),
+        "text": clean_fallback_text(text, preserve_boundaries=preserve_boundaries),
     }

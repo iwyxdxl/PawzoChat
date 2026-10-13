@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""REST API for per-persona memory CRUD."""
+"""REST API for private and per-group persona memory CRUD."""
 
 from __future__ import annotations
 
@@ -46,6 +46,13 @@ def _write_conflict(persona_id: str, operation: str, exc: ValueError):
     return jsonify({"error": str(exc)}), 409
 
 
+def _group_storage_error(persona_id: str, group_id: str, exc: Exception):
+    logger.warning("群记忆访问失败 persona=%s group=%s", persona_id, group_id, exc_info=True)
+    if isinstance(exc, KeyError):
+        return jsonify({"error": "群记忆来源不存在，请刷新后重试"}), 404
+    return jsonify({"error": "无法读写群记忆，请检查该群的记忆存档"}), 503
+
+
 def _validate_summary(value) -> tuple[str, str]:
     """Return (summary, error); a non-empty error means validation failed."""
     if not isinstance(value, str):
@@ -58,14 +65,45 @@ def _validate_summary(value) -> tuple[str, str]:
     return summary, ""
 
 
-@api_memory_bp.route("/<persona_id>/memories", methods=["GET"])
-def list_memories(persona_id: str):
-    app = get_app()
-    personas_cfg = app.config.get("personas", default={})
-    if persona_id not in personas_cfg:
-        return jsonify({"error": "Persona not found"}), 404
+def _memory_target(app, persona_id: str, group_id: str | None):
+    """Resolve a trusted scope without creating a memory archive from input."""
+    if persona_id not in app.config.get("personas", default={}):
+        return None, (), (jsonify({"error": "Persona not found"}), 404)
+    if group_id is None:
+        return app.memory_service, (persona_id,), None
+    service = getattr(app, "group_memory_service", None)
+    try:
+        exists = service is not None and service.has_source(group_id, persona_id)
+    except ValueError:
+        exists = False
+    if not exists:
+        return None, (), (jsonify({"error": "群记忆来源不存在"}), 404)
+    return service, (group_id, persona_id), None
 
-    data = app.memory_service.load_memories(persona_id)
+
+@api_memory_bp.get("/<persona_id>/group-memories")
+def list_group_memory_sources(persona_id: str):
+    app = get_app()
+    if persona_id not in app.config.get("personas", default={}):
+        return jsonify({"error": "Persona not found"}), 404
+    service = getattr(app, "group_memory_service", None)
+    return jsonify({"groups": service.list_sources(persona_id) if service is not None else []})
+
+
+@api_memory_bp.route("/<persona_id>/memories", methods=["GET"])
+@api_memory_bp.get("/<persona_id>/group-memories/<group_id>")
+def list_memories(persona_id: str, group_id: str | None = None):
+    app = get_app()
+    service, scope, error = _memory_target(app, persona_id, group_id)
+    if error is not None:
+        return error
+
+    try:
+        data = service.load_memories(*scope)
+    except (KeyError, OSError, ValueError) as exc:
+        if group_id is None:
+            raise
+        return _group_storage_error(persona_id, group_id, exc)
     memories = data.get("memories", [])
     memories_sorted = sorted(
         enumerate(memories),
@@ -76,7 +114,7 @@ def list_memories(persona_id: str):
     for idx, m in memories_sorted:
         result.append({
             "index": idx,
-            "fingerprint": app.memory_service.fingerprint(m),
+            "fingerprint": service.fingerprint(m),
             "summary": m.get("summary", ""),
             "importance": m.get("importance", 3),
             "created_at": m.get("created_at", ""),
@@ -85,11 +123,12 @@ def list_memories(persona_id: str):
 
 
 @api_memory_bp.route("/<persona_id>/memories", methods=["POST"])
-def add_memory(persona_id: str):
+@api_memory_bp.post("/<persona_id>/group-memories/<group_id>")
+def add_memory(persona_id: str, group_id: str | None = None):
     app = get_app()
-    personas_cfg = app.config.get("personas", default={})
-    if persona_id not in personas_cfg:
-        return jsonify({"error": "Persona not found"}), 404
+    service, scope, error = _memory_target(app, persona_id, group_id)
+    if error is not None:
+        return error
 
     data = request.get_json(force=True)
     if not isinstance(data, dict):
@@ -107,20 +146,25 @@ def add_memory(persona_id: str):
         return jsonify({"error": "created_at 必须是字符串"}), 400
 
     try:
-        entry, _ = app.memory_service.add_memory(
-            persona_id, summary, importance, created_at,
+        entry, _ = service.add_memory(
+            *scope, summary, importance, created_at,
         )
     except DuplicateMemoryError as exc:
         return _write_conflict(persona_id, "add", exc)
+    except (KeyError, OSError, ValueError) as exc:
+        if group_id is None:
+            raise
+        return _group_storage_error(persona_id, group_id, exc)
     return jsonify({"ok": True, "memory": entry}), 201
 
 
 @api_memory_bp.route("/<persona_id>/memories/<int:index>", methods=["PUT"])
-def update_memory(persona_id: str, index: int):
+@api_memory_bp.put("/<persona_id>/group-memories/<group_id>/<int:index>")
+def update_memory(persona_id: str, index: int, group_id: str | None = None):
     app = get_app()
-    personas_cfg = app.config.get("personas", default={})
-    if persona_id not in personas_cfg:
-        return jsonify({"error": "Persona not found"}), 404
+    service, scope, error = _memory_target(app, persona_id, group_id)
+    if error is not None:
+        return error
 
     data = request.get_json(force=True)
     fingerprint = data.get("fingerprint") if isinstance(data, dict) else None
@@ -146,26 +190,48 @@ def update_memory(persona_id: str, index: int):
         return jsonify({"error": "没有需要更新的字段"}), 400
 
     try:
-        app.memory_service.update_memory(
-            persona_id, index, updates, expected_fingerprint=fingerprint,
+        service.update_memory(
+            *scope, index, updates, expected_fingerprint=fingerprint,
         )
     except (MemoryConflictError, DuplicateMemoryError) as exc:
         return _write_conflict(persona_id, "update", exc)
+    except (KeyError, OSError, ValueError) as exc:
+        if group_id is None:
+            raise
+        return _group_storage_error(persona_id, group_id, exc)
     return jsonify({"ok": True})
 
 
 @api_memory_bp.route("/<persona_id>/memories/<int:index>", methods=["DELETE"])
-def delete_memory(persona_id: str, index: int):
+@api_memory_bp.delete("/<persona_id>/group-memories/<group_id>/<int:index>")
+def delete_memory(persona_id: str, index: int, group_id: str | None = None):
     app = get_app()
-    personas_cfg = app.config.get("personas", default={})
-    if persona_id not in personas_cfg:
-        return jsonify({"error": "Persona not found"}), 404
+    service, scope, error = _memory_target(app, persona_id, group_id)
+    if error is not None:
+        return error
 
     fingerprint = request.args.get("fingerprint")
     if not _valid_fingerprint(fingerprint):
         return jsonify({"error": "缺少或无效的记忆校验值，请刷新后重新打开。"}), 400
     try:
-        app.memory_service.delete_memory(persona_id, index, expected_fingerprint=fingerprint)
+        service.delete_memory(*scope, index, expected_fingerprint=fingerprint)
     except MemoryConflictError as exc:
         return _write_conflict(persona_id, "delete", exc)
+    except (KeyError, OSError, ValueError) as exc:
+        if group_id is None:
+            raise
+        return _group_storage_error(persona_id, group_id, exc)
     return jsonify({"ok": True})
+
+
+@api_memory_bp.delete("/<persona_id>/group-memories/<group_id>")
+def delete_group_memory_source(persona_id: str, group_id: str):
+    app = get_app()
+    service, scope, error = _memory_target(app, persona_id, group_id)
+    if error is not None:
+        return error
+    try:
+        source_deleted = service.delete_source(*scope)
+    except (KeyError, OSError, ValueError) as exc:
+        return _group_storage_error(persona_id, group_id, exc)
+    return jsonify({"ok": True, "source_deleted": source_deleted})

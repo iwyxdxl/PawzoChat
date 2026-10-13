@@ -27,8 +27,10 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 from pawzochat.llm.base import ContentBlock
@@ -44,6 +46,14 @@ logger = logging.getLogger(__name__)
 _IMAGE_DATA_RE = re.compile(r"^\$image_data\((\w+)\)$")
 _FILE_PATH_RE = re.compile(r"^\$file_path\((\w+)\)$")
 _FILE_DATA_RE = re.compile(r"^\$file_data\((\w+)\)$")
+
+
+def _registry_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 @dataclass
@@ -74,6 +84,9 @@ class CapabilityAdapterRegistry:
     to the ``MCPManager``."""
 
     def __init__(self, mcp_manager: MCPManager):
+        self._lock = threading.RLock()
+        self._paused_owners: set[str] = set()
+        self._active_owners: dict[str, int] = {}
         self._adapters: dict[str, CapabilityAdapter] = {}
         # capability_name → owner tag.
         # ""           : loaded from ``capability_adapters`` config (cleared on reload)
@@ -86,6 +99,7 @@ class CapabilityAdapterRegistry:
 
     # ---- Registration -----------------------------------------------------
 
+    @_registry_locked
     def load_from_config(self, adapters_cfg: dict):
         """Populate the registry from the ``capability_adapters`` section
         of ``config.yaml``.
@@ -111,6 +125,7 @@ class CapabilityAdapterRegistry:
             )
             self.register(adapter)
 
+    @_registry_locked
     def reload(self, adapters_cfg: dict):
         """Clear MCP-backed adapters and reload from config.
 
@@ -131,6 +146,7 @@ class CapabilityAdapterRegistry:
         if adapters_cfg:
             self.load_from_config(adapters_cfg)
 
+    @_registry_locked
     def register(self, adapter: CapabilityAdapter, *, owner: str = ""):
         """Register an adapter with an optional owner tag.
 
@@ -168,6 +184,7 @@ class CapabilityAdapterRegistry:
         )
         self.register(adapter, owner="builtin")
 
+    @_registry_locked
     def register_plugin_tool(
         self,
         name: str,
@@ -197,6 +214,19 @@ class CapabilityAdapterRegistry:
         )
         self.register(adapter, owner=owner)
 
+    @_registry_locked
+    def pause_owner(self, owner: str) -> bool:
+        """Reject a busy owner, otherwise prevent new execution until resumed."""
+        if self._active_owners.get(owner, 0):
+            return False
+        self._paused_owners.add(owner)
+        return True
+
+    @_registry_locked
+    def resume_owner(self, owner: str) -> None:
+        self._paused_owners.discard(owner)
+
+    @_registry_locked
     def unregister_owner(self, owner: str) -> list[str]:
         """Remove every capability registered under ``owner``.
 
@@ -215,6 +245,7 @@ class CapabilityAdapterRegistry:
             self._owners.pop(name, None)
         return removed
 
+    @_registry_locked
     def get_tools_by_owner(self, owner: str) -> list[dict]:
         """Return tool definitions registered under ``owner``.
 
@@ -227,6 +258,7 @@ class CapabilityAdapterRegistry:
 
     # ---- Query ------------------------------------------------------------
 
+    @_registry_locked
     def get_tool_definitions(self) -> list[dict]:
         """Return MCP-style tool definitions for all registered adapters."""
         defs: list[dict] = []
@@ -254,6 +286,7 @@ class CapabilityAdapterRegistry:
             })
         return defs
 
+    @_registry_locked
     def is_capability_tool(self, tool_name: str) -> bool:
         return tool_name in self._adapters
 
@@ -275,9 +308,16 @@ class CapabilityAdapterRegistry:
         3. Route to the backing MCP Server tool via ``MCPManager``, bounded
            by *timeout* (seconds).
         """
-        adapter = self._adapters.get(tool_name)
-        if not adapter:
-            return [ContentBlock(type="text", text=f"Unknown capability: {tool_name}")]
+        with self._lock:
+            adapter = self._adapters.get(tool_name)
+            if not adapter:
+                return [ContentBlock(type="text", text=f"Unknown capability: {tool_name}")]
+            owner = self._owners.get(tool_name, "")
+            tracked = owner.startswith("plugin:") and adapter.local_handler is not None
+            if tracked:
+                if owner in self._paused_owners:
+                    return [ContentBlock(type="text", text="Plugin is stopping; retry later")]
+                self._active_owners[owner] = self._active_owners.get(owner, 0) + 1
 
         ctx = context or {}
 
@@ -287,6 +327,14 @@ class CapabilityAdapterRegistry:
             except Exception as exc:
                 logger.exception("内置能力执行失败: %s", tool_name)
                 return [ContentBlock(type="text", text=f"工具执行失败: {exc}")]
+            finally:
+                if tracked:
+                    with self._lock:
+                        remaining = self._active_owners[owner] - 1
+                        if remaining:
+                            self._active_owners[owner] = remaining
+                        else:
+                            self._active_owners.pop(owner, None)
 
         mcp_args = self._build_mcp_args(adapter, arguments, ctx)
 

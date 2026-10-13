@@ -30,6 +30,7 @@ PawzoChat 是一个功能强大的 AI 对话平台，基于大语言模型（LLM
 - **一键生成人设** — 输入一句话需求，AI 自动撰写完整的人设 Prompt
 - **AI 记忆系统** — 角色在对话中自主决定何时记录/更新记忆，超限自动合并；Web 面板可手动管理
 - **情绪表情** — 根据对话内容自动检测情绪并插入贴纸/表情包，支持自定义表情库
+- **Web 多角色群聊** — 邀请多个 AI 角色同群互动，支持 @成员、@所有人、角色互相接话，以及图片、表情和语音回复；可自定义群内人设、发言节奏与每位成员的群记忆
 
 ### 多平台接入
 - **微信** — 基于 iLink 协议（长轮询），扫码登录，支持文本/图片/文件/语音消息收发
@@ -88,6 +89,19 @@ PawzoChat 提供功能完备的 Web 管理面板，支持桌面端和移动端�
   <img src="docs/images/screenshot_settings.png" width="700" alt="设置页面">
 </div>
 
+### 多角色群聊
+
+把喜欢的 AI 角色邀请到同一个群里，一起聊天、分享图片、围绕话题展开讨论。
+
+- **互动接话** — 支持 @成员、@所有人，角色也可互相 @ 邀请对方加入讨论。
+- **丰富表达** — 支持发送文字、图片、文件和表情，角色可在聊天中生成图片、发送情绪表情与语音回复。
+- **自定义群聊氛围** — 设置共同背景与聊天规则，为每位成员编写群内专属人设，调整回复概率和连续回复上限。
+- **各自记住相处点滴** — 每位角色拥有独立的群记忆，可分别查看、编辑和管理。
+
+<div align="center">
+  <img src="docs/images/screenshot_group_chat.png" width="700" alt="多角色群聊演示：小柒分享表情和生成的图片，苏阮阮接话互动">
+</div>
+
 ### 跨平台同步效果
 
 PawzoChat 自动同步微信和 QQ 平台的聊天内容到 Web 管理面板，呈现统一的对话界面，左侧为原始平台截图，右侧为 PawzoChat 面板同步效果。
@@ -112,9 +126,6 @@ AI 角色可自主发布图文动态，其他角色和用户均可点赞、评�
 | <img src="docs/images/chat_list.png" width="300" alt="聊天列表"> | <img src="docs/images/moments_feed.png" width="300" alt="朋友圈动态"> |
 
 </div>
-
-> **免责声明：** 本文档及所有示例截图（包括聊天内容、朋友圈动态等）仅用于演示 PawzoChat 效果的界面示意，不反映也不代表作者或贡献者的任何立场、观点或价值观。
-
 
 ## 快速开始
 
@@ -182,7 +193,7 @@ PawzoChat/
 │   ├── llm/                 # LLM Provider 抽象与多后端实现
 │   ├── mcp/                 # MCP 协议支持（连接管理、工具聚合、适配器）
 │   ├── image/               # 图像生成（OpenAI/Gemini/NovelAI 后端）
-│   ├── voice/               # TTS 语音合成（MiniMax/OpenAI 后端 + 转码）
+│   ├── voice/               # TTS 语音合成（MiniMax/MiMo/ElevenLabs/OpenAI + 转码）
 │   ├── services/            # 对话/队列/记忆/表情/朋友圈核心服务
 │   ├── channels/            # 通道抽象（微信/QQ/Web/插件）
 │   ├── transport/           # iLink 协议客户端、QQ 网关、CDN 媒体
@@ -233,7 +244,7 @@ PawzoChat/
 |--------|------|
 | `llm_providers` | LLM 服务商与模型列表 |
 | `image_providers` | 生图服务商（OpenAI/Gemini/NovelAI） |
-| `voice_providers` | TTS 语音服务商（MiniMax/OpenAI） |
+| `voice_providers` | TTS 语音服务商（MiniMax/MiMo/ElevenLabs/OpenAI） |
 | `personas` | 角色列表（绑定模型、提示词、记忆/生图/语音开关） |
 | `mcp_servers` | MCP 工具服务器配置 |
 | `capability_adapters` | 能力适配器（如 `recognize_image`） |
@@ -257,7 +268,7 @@ PawzoChat/
 - **自定义** — 填写任意 OpenAI 兼容 Base URL + API Key
 
 生图后端：OpenAI Image / NanoBanana (Gemini) / NovelAI
-语音后端：MiniMax 原生 / MiMo 原生 / OpenAI 兼容 TTS
+语音后端：MiniMax 原生 / MiMo 原生 / ElevenLabs 原生（Eleven v4）/ OpenAI 兼容 TTS
 
 ## 文档
 

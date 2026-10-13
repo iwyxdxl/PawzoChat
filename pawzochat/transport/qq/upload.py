@@ -113,7 +113,7 @@ class RichMediaUploader:
 
     def post(self, suffix, payload):
         self.check()
-        return self.client.api_post(f'/v2/users/{self.openid}/{suffix}', payload, timeout=30)
+        return self.client.api_post(f'/v2/users/{self.openid}/{suffix}', payload, timeout=120)
 
     def upload(self, source):
         try:
@@ -221,8 +221,8 @@ class RichMediaUploader:
                 if not 200 <= response.status_code < 300:
                     raise QQClientError(f"QQ 分片上传失败 HTTP {response.status_code}",
                                         retryable=response.status_code >= 500)
-        except requests.RequestException as exc:
-            raise QQClientError("QQ 分片上传网络错误", retryable=True) from exc
+        except requests.RequestException:
+            raise QQClientError("QQ 分片上传网络错误", retryable=True) from None
 
     @staticmethod
     def _result(result):

@@ -17,7 +17,13 @@
  */
 import { esc, iconHtml } from "./utils.js";
 import { api } from "./api.js";
-import { toast, showLoading, hideLoading } from "./ui.js";
+import { toast, showLoading, hideLoading, confirm } from "./ui.js";
+import { state } from "./state.js";
+import {
+  pluginListActionsMarkup, pluginSourceMarkup, pluginDetailUpdateMarkup,
+  pluginTaskListMarkup, pluginUpdateBadge, pluginInstallMount, pluginErrorMessage,
+  pluginForgetUninstalled, pluginSyncInstalled,
+} from "./plugin_install.js";
 import {
   setTopBar, goBack,
   registerPageRenderer,
@@ -27,12 +33,22 @@ const content = () => document.getElementById("content-area");
 
 let _pluginsCache = [];
 let _currentPlugin = null;
+let _renderRequest = 0;
+let _uninstallPending = false;
+let _uninstalling = false;
+
+function _startRender() {
+  const page = state.pageStack.at(-1);
+  const request = ++_renderRequest;
+  return () => request === _renderRequest && state.pageStack.at(-1) === page;
+}
 
 const _STATUS_LABELS = {
   active: "运行中",
   disabled: "已停用",
   broken: "异常",
   discovered: "已发现",
+  unsupported: "不支持此系统",
 };
 
 const _PERMISSION_LABELS = {
@@ -44,8 +60,8 @@ const _PERMISSION_LABELS = {
 
 let _iframeMessageHandler = null;
 
-function _statusBadge(status) {
-  const label = _STATUS_LABELS[status] || status;
+function _statusBadge(status, platformError) {
+  const label = platformError === "platform_invalid" ? "信息有误" : _STATUS_LABELS[status] || status;
   const cls = `plugin-status-${status === "active" ? "active" : status === "broken" ? "broken" : "disabled"}`;
   return `<span class="plugin-status ${cls}">${esc(label)}</span>`;
 }
@@ -53,17 +69,25 @@ function _statusBadge(status) {
 /* ============ Plugin List Page ============ */
 
 async function renderPluginList() {
+  const isCurrent = _startRender();
+  _currentPlugin = null;
+  _detachIframeHandler();
   setTopBar("插件管理", true,
-    `<button class="top-btn" onclick="PawzoChat.pluginRefresh()" title="刷新插件列表">
+    `<button class="top-btn plugin-refresh-btn" onclick="PawzoChat.pluginRefresh()" title="刷新插件列表" aria-label="刷新插件列表">
       ${iconHtml("ri-refresh-line")}
     </button>`
   );
   content().innerHTML = `<div class="loading-center"><div class="spinner"></div></div>`;
 
   try {
-    const res = await api.get("/api/plugins");
+    // A post-uninstall render must not join a GET started before deletion.
+    const response = await fetch(`${window.PAWZOCHAT_BASE || ""}/api/plugins`, { cache: "no-store" });
+    if (!response.ok) throw new Error("Plugin list unavailable");
+    const res = await response.json();
+    if (!isCurrent()) return;
     _pluginsCache = res.plugins || [];
   } catch (e) {
+    if (!isCurrent()) return;
     toast("加载插件列表失败", "error");
     return;
   }
@@ -72,24 +96,26 @@ async function renderPluginList() {
 }
 
 function _renderPluginListBody() {
+  pluginSyncInstalled(_pluginsCache);
   const warning = `<div class="plugin-warning">
     ${iconHtml("ri-error-warning-line")}
     <span>安装第三方插件等同于在本机执行不受限的代码，请确认插件来源可信后再启用。PawzoChat 不对第三方插件的安全性负责，使用风险自负。</span>
   </div>`;
 
   if (_pluginsCache.length === 0) {
-    content().innerHTML = `<div class="page">
-      ${warning}
+    content().innerHTML = `<div class="page plugin-page">
+      ${warning}${pluginListActionsMarkup()}
       <div class="empty-state">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.4">
           <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9v-2h2v2zm0-4H9V7h2v5zm4 4h-2v-2h2v2zm0-4h-2V7h2v5z"/>
         </svg>
         <div class="empty-text">暂无已安装的插件</div>
         <div style="font-size:13px;color:var(--text-3);margin-top:8px;max-width:280px;text-align:center;line-height:1.5">
-          将插件目录放入 <code style="background:var(--bg);padding:1px 4px;border-radius:3px">data/plugins/</code> 后点击右上角刷新
+          ${window.PAWZOCHAT_BASE || state.settings?.is_public ? "请在本机打开 PawzoChat 安装插件。" : "点击「添加插件」，添加第一个插件。"}
         </div>
       </div>
     </div>`;
+    pluginInstallMount();
     return;
   }
 
@@ -106,39 +132,42 @@ function _renderPluginListBody() {
       <div class="card-row" onclick="PawzoChat.pushPage('pluginDetail','${esc(p.id)}')">
         <div class="row-icon orange">${iconHtml("ri-plug-line")}</div>
         <div style="flex:1;min-width:0">
-          <div style="display:flex;align-items:center;gap:8px">
+          <div class="plugin-card-title">
             <span style="font-size:14px;font-weight:500">${esc(p.name)}</span>
-            ${_statusBadge(p.status)}
+            ${_statusBadge(p.status, p.platform_error)}
+            <span data-plugin-update="${esc(p.id)}">${pluginUpdateBadge(p.id)}</span>
           </div>
           ${desc}
           <div style="font-size:11px;color:var(--text-3);margin-top:2px">${esc(meta)}</div>
         </div>
-        <label class="switch-wrap" onclick="event.stopPropagation()">
-          <input type="checkbox" ${p.enabled ? "checked" : ""}
-            onchange="PawzoChat.pluginToggle('${esc(p.id)}',this.checked)">
-          <span class="switch-track"></span>
-        </label>
+        ${iconHtml("ri-arrow-right-s-line", "plugin-row-arrow")}
       </div>
     </div>`;
   }).join("");
 
-  content().innerHTML = `<div class="page">${warning}${cards}</div>`;
+  content().innerHTML = `<div class="page plugin-page">${warning}${pluginListActionsMarkup()}${cards}</div>`;
+  pluginInstallMount();
 }
 
 /* ============ Plugin Detail Page ============ */
 
 async function renderPluginDetail(pluginId) {
+  const isCurrent = _startRender();
+  _detachIframeHandler();
   setTopBar("插件详情", true, "");
   content().innerHTML = `<div class="loading-center"><div class="spinner"></div></div>`;
 
   try {
-    _currentPlugin = await api.get(`/api/plugins/${pluginId}`);
+    const plugin = await api.get(`/api/plugins/${pluginId}`, { bypassCache: true });
+    if (!isCurrent()) return;
+    _currentPlugin = plugin;
     if (_currentPlugin.error) {
       toast("插件未找到", "error");
       goBack();
       return;
     }
   } catch (e) {
+    if (!isCurrent()) return;
     toast("加载插件详情失败", "error");
     goBack();
     return;
@@ -164,23 +193,28 @@ function _renderPluginDetailBody() {
   const desc = m.description
     ? `<div style="font-size:13px;color:var(--text-2);margin-top:4px;line-height:1.5">${esc(m.description)}</div>`
     : "";
-  const errorBlock = p.last_error
-    ? `<div class="plugin-error">${esc(p.last_error)}</div>`
+  const errorBlock = p.platform_compatible === false
+    ? `<div class="plugin-error">${p.platform_error === "platform_invalid" ? "插件信息有误，请重新安装。" : "此插件不支持当前系统。"}</div>`
+    : p.last_error
+    ? `<div class="plugin-error">插件暂时无法正常运行，请尝试重新加载或联系作者。</div>`
     : "";
 
   const metaRows = [];
   if (m.author) metaRows.push(_metaRow("作者", esc(m.author)));
+  const sourceMarkup = pluginSourceMarkup(p);
+  if (sourceMarkup) metaRows.push(sourceMarkup);
+  const advancedRows = [_metaRow("API 版本", esc(m.api_version || 1))];
   if ((m.hooks || []).length)
-    metaRows.push(_metaRow("Hooks", m.hooks.map(h => `<code>${esc(h)}</code>`).join(" ")));
+    advancedRows.push(_metaRow("Hooks", m.hooks.map(h => `<code>${esc(h)}</code>`).join(" ")));
   if ((m.depends_on || []).length)
-    metaRows.push(_metaRow("依赖", m.depends_on.map(d => esc(d)).join(", ")));
+    advancedRows.push(_metaRow("依赖", m.depends_on.map(d => esc(d)).join(", ")));
   const perms = m.permissions || [];
   if (perms.length) {
     const items = perms.map(perm => {
       const label = _PERMISSION_LABELS[perm] || perm;
       return `<code title="${esc(label)}">${esc(perm)}</code>`;
     }).join(" ");
-    metaRows.push(_metaRow("权限", items));
+    advancedRows.push(_metaRow("权限", items));
   }
 
   const hasSchemaFields = schema.type === "object" && schema.properties
@@ -189,7 +223,7 @@ function _renderPluginDetailBody() {
   const providedTools = Array.isArray(p.provided_tools) ? p.provided_tools : [];
   const toolsSection = providedTools.length === 0
     ? ""
-    : `<div class="card" style="margin:12px 16px 0">
+    : `<div class="plugin-advanced-tools">
         <div class="card-header">该插件提供的 LLM 工具</div>
         ${providedTools.map(t => {
           const desc = t.description
@@ -204,19 +238,15 @@ function _renderPluginDetailBody() {
 
   let configSection = "";
   if (useCustomUi) {
-    const base = window.PAWZOCHAT_BASE || "";
-    const entry = _encodePluginUiPath(configUi.entry);
-    const src = `${base}/api/plugins/${encodeURIComponent(p.id)}/ui/${entry}`;
-    const initialHeight = (typeof configUi.height === "number" && configUi.height > 0)
-      ? `${configUi.height}px`
-      : (configUi.height && configUi.height !== "auto" ? esc(String(configUi.height)) : "320px");
+    const src = p.config_ui_url;
     configSection = `
       <div class="card" style="margin:12px 16px 0">
         <div class="card-header">插件配置</div>
         <iframe id="plugin-config-frame"
           src="${esc(src)}"
           sandbox="allow-scripts"
-          style="width:100%;border:0;display:block;height:${initialHeight}"></iframe>
+          title="插件配置"
+          style="width:100%;border:0;display:block;height:1px"></iframe>
       </div>`;
   } else if (hasSchemaFields) {
     configSection = `
@@ -229,14 +259,14 @@ function _renderPluginDetailBody() {
       </div>`;
   }
 
-  content().innerHTML = `<div class="page">
+  content().innerHTML = `<div class="page plugin-page">
     <div class="card" style="margin:8px 16px">
       <div style="padding:16px">
-        <div style="display:flex;align-items:center;gap:8px">
+        <div class="plugin-card-title">
           <span style="font-size:16px;font-weight:600">${esc(m.name || p.name)}</span>
-          ${_statusBadge(p.status)}
+          ${_statusBadge(p.status, p.platform_error)}
         </div>
-        <div style="font-size:12px;color:var(--text-3);margin-top:2px">v${esc(m.version || p.version)} · API v${m.api_version || 1}</div>
+        <div style="font-size:12px;color:var(--text-3);margin-top:2px">v${esc(m.version || p.version)}</div>
         ${desc}
         ${errorBlock}
         ${metaRows.length ? `<div class="plugin-meta">${metaRows.join("")}</div>` : ""}
@@ -247,20 +277,33 @@ function _renderPluginDetailBody() {
         <label>启用插件</label>
         <label class="switch-wrap">
           <input type="checkbox" id="plugin-enabled-toggle" ${p.enabled ? "checked" : ""}
+            ${p.platform_compatible === false && !p.enabled ? 'disabled title="此插件无法在当前系统启用"' : ""}
             onchange="PawzoChat.pluginToggle('${esc(p.id)}',this.checked)">
           <span class="switch-track"></span>
         </label>
       </div></div>
       <div class="form-group"><div class="form-row">
         <label>重新加载</label>
-        <button class="btn-outline btn-sm" style="margin-left:auto" onclick="PawzoChat.pluginReload('${esc(p.id)}')">重载</button>
+        <button class="btn-outline btn-sm plugin-action-button" style="margin-left:auto" onclick="PawzoChat.pluginReload('${esc(p.id)}')">重新加载</button>
       </div></div>
+      ${pluginDetailUpdateMarkup(p)}
     </div>
-    ${toolsSection}
+    ${pluginTaskListMarkup()}
     ${configSection}
+    <details class="card plugin-advanced"><summary>高级信息</summary><div class="plugin-advanced-body">
+      <div class="plugin-meta">${advancedRows.join("")}</div>
+      ${p.last_error ? `<div class="plugin-error">${esc(p.last_error)}</div>` : ""}
+      ${toolsSection}
+    </div></details>
+    ${window.PAWZOCHAT_BASE || state.settings?.is_public ? "" : `<div class="card plugin-uninstall-card">
+      <button type="button" class="btn-text danger plugin-uninstall-button" id="plugin-uninstall-button">${iconHtml("ri-delete-bin-line")}<span>卸载插件</span></button>
+      <p id="plugin-uninstall-error" class="plugin-uninstall-error" role="alert" hidden></p>
+    </div>`}
   </div>`;
 
-  if (useCustomUi) _attachIframeHandler(p, schema, settings, configUi);
+  document.getElementById("plugin-uninstall-button")?.addEventListener("click", () => pluginUninstall(p.id));
+  if (useCustomUi) _attachIframeHandler(p, schema, settings);
+  pluginInstallMount(p);
 }
 
 function _metaRow(label, value) {
@@ -268,14 +311,6 @@ function _metaRow(label, value) {
     <span class="plugin-meta-label">${esc(label)}</span>
     <span>${value}</span>
   </div>`;
-}
-
-function _encodePluginUiPath(path) {
-  return String(path || "")
-    .split("/")
-    .filter(Boolean)
-    .map(part => encodeURIComponent(part))
-    .join("/");
 }
 
 /* ============ Schema Form Renderer ============ */
@@ -328,7 +363,7 @@ function _renderField(key, prop, value) {
   if (type === "string" && prop.multiline) {
     return `<div class="form-group"><div class="form-row" style="flex-direction:column;align-items:stretch;gap:4px">
       <label>${esc(title)}</label>
-      <textarea ${da} rows="4"${ph} style="width:100%;resize:vertical;box-sizing:border-box">${esc(value || "")}</textarea>
+      <textarea class="form-input" ${da} rows="4"${ph}>${esc(value || "")}</textarea>
     </div>${hint}</div>`;
   }
 
@@ -354,7 +389,7 @@ function _renderField(key, prop, value) {
     const arrPh = ph || ` placeholder="每行一项"`;
     return `<div class="form-group"><div class="form-row" style="flex-direction:column;align-items:stretch;gap:4px">
       <label>${esc(title)}</label>
-      <textarea ${da} data-cfg-array="lines" rows="4"${arrPh} style="width:100%;resize:vertical;box-sizing:border-box">${esc(lines)}</textarea>
+      <textarea class="form-input" ${da} data-cfg-array="lines" rows="4"${arrPh}>${esc(lines)}</textarea>
     </div>${hint}</div>`;
   }
 
@@ -387,33 +422,82 @@ function _collectSettings() {
 
 /* ============ Exported actions ============ */
 
+export async function pluginUninstall(pluginId) {
+  if (_uninstallPending || window.PAWZOCHAT_BASE || state.settings?.is_public || _currentPlugin?.id !== pluginId) return;
+  const page = state.pageStack.at(-1);
+  const plugin = _currentPlugin;
+  _uninstallPending = true;
+  let host;
+  try {
+    if (!await confirm("卸载插件", `确定卸载「${plugin.manifest?.name || plugin.name}」吗？插件文件、配置和插件目录内的数据将被永久删除，无法撤销。`, true, "卸载")) return;
+    if (state.pageStack.at(-1) !== page) return;
+    _uninstalling = true;
+    ++_renderRequest;
+    host = content().querySelector(".plugin-page");
+    if (host) { host.inert = true; host.setAttribute("aria-busy", "true"); }
+    const button = document.getElementById("plugin-uninstall-button");
+    if (button) { button.disabled = true; button.querySelector("span").textContent = "正在卸载…"; }
+    const error = document.getElementById("plugin-uninstall-error");
+    if (error) error.hidden = true;
+    showLoading("正在卸载…");
+    const res = await api.del(`/api/plugins/${encodeURIComponent(pluginId)}`);
+    if (res.status >= 400) {
+      const message = res.data.error === "plugin_in_use" && res.data.dependents?.length
+        ? `请先卸载依赖此插件的插件：${res.data.dependents.map(p => p.name || p.id).join("、")}`
+        : res.data.error === "conflict" ? "插件目录或 ID 存在冲突，请检查本地目录后重试。"
+        : pluginErrorMessage(res.data, "卸载失败，请稍后重试。");
+      if (state.pageStack.at(-1) === page && error) { error.textContent = message; error.hidden = false; }
+      toast(message, "error");
+      return;
+    }
+    pluginForgetUninstalled(pluginId);
+    _pluginsCache = _pluginsCache.filter(p => p.id !== pluginId);
+    toast("插件已卸载", "success");
+    if (state.pageStack.at(-1) === page) {
+      _currentPlugin = null;
+      _detachIframeHandler();
+      goBack();
+    } else if (state.pageStack.at(-1)?.name === "pluginList") {
+      renderPluginList();
+    }
+  } catch (_) {
+    toast("暂时无法确认卸载结果，请刷新插件列表后重试。", "error");
+  } finally {
+    if (host) { host.inert = false; host.removeAttribute("aria-busy"); }
+    if (_uninstalling) hideLoading();
+    _uninstalling = false;
+    _uninstallPending = false;
+    if (state.pageStack.at(-1) === page) {
+      const button = document.getElementById("plugin-uninstall-button");
+      if (button) { button.disabled = false; button.querySelector("span").textContent = "卸载插件"; }
+    }
+  }
+}
+
 export async function pluginToggle(pluginId, enabled) {
+  if (_uninstalling) return;
+  const page = state.pageStack.at(-1);
   const endpoint = enabled ? "enable" : "disable";
   showLoading("操作中…");
   try {
     const res = await api.post(`/api/plugins/${pluginId}/${endpoint}`, {});
+    if (_uninstalling) return;
     if (res.status >= 400) {
-      toast(res.data.error || "操作失败", "error");
-      _revertToggle();
+      toast(pluginErrorMessage(res.data), "error");
+      if (state.pageStack.at(-1) === page) _revertToggle();
       return;
     }
     toast(enabled ? "已启用" : "已停用", "success");
 
-    if (_currentPlugin && _currentPlugin.id === pluginId) {
+    if (state.pageStack.at(-1) === page && _currentPlugin?.id === pluginId) {
       _currentPlugin = res.data.plugin;
       _renderPluginDetailBody();
-    } else {
-      try {
-        const listRes = await api.get("/api/plugins");
-        _pluginsCache = listRes.plugins || [];
-        _renderPluginListBody();
-      } catch (_) { /* silent */ }
     }
   } catch (e) {
     toast("操作失败", "error");
-    _revertToggle();
+    if (state.pageStack.at(-1) === page) _revertToggle();
   }
-  finally { hideLoading(); }
+  finally { if (!_uninstalling) hideLoading(); }
 }
 
 function _revertToggle() {
@@ -422,55 +506,66 @@ function _revertToggle() {
 }
 
 export async function pluginSaveConfig(pluginId) {
+  if (_uninstalling) return;
+  const page = state.pageStack.at(-1);
   const settings = _collectSettings();
   showLoading("保存中…");
   try {
     const res = await api.patch(`/api/plugins/${pluginId}/config`, { settings });
+    if (_uninstalling) return;
     if (res.status >= 400) {
-      toast(res.data.error || "保存失败", "error");
+      toast(pluginErrorMessage(res.data, "保存失败，请检查设置后重试。"), "error");
       return;
     }
     toast("配置已保存", "success");
+    if (state.pageStack.at(-1) !== page) return;
     _currentPlugin = res.data.plugin;
     _renderPluginDetailBody();
   } catch (e) {
     toast("保存失败", "error");
   }
-  finally { hideLoading(); }
+  finally { if (!_uninstalling) hideLoading(); }
 }
 
 export async function pluginReload(pluginId) {
-  showLoading("重载中…");
+  if (_uninstalling) return;
+  const page = state.pageStack.at(-1);
+  showLoading("正在重新加载…");
   try {
     const res = await api.post(`/api/plugins/${pluginId}/reload`, {});
+    if (_uninstalling) return;
     if (res.status >= 400) {
-      toast(res.data.error || "重载失败", "error");
+      toast(pluginErrorMessage(res.data, "重新加载失败，请稍后重试。"), "error");
       return;
     }
-    toast("已重载", "success");
+    toast("已重新加载", "success");
+    if (state.pageStack.at(-1) !== page) return;
     _currentPlugin = res.data.plugin;
     _renderPluginDetailBody();
   } catch (e) {
-    toast("重载失败", "error");
+    toast("重新加载失败", "error");
   }
-  finally { hideLoading(); }
+  finally { if (!_uninstalling) hideLoading(); }
 }
 
 export async function pluginRefresh() {
+  if (_uninstalling) return;
+  const isCurrent = _startRender();
   showLoading("刷新中…");
   try {
     const res = await api.post("/api/plugins/refresh", {});
+    if (!isCurrent()) return;
     if (res.status >= 400) {
-      toast(res.data.error || "刷新失败", "error");
+      toast(pluginErrorMessage(res.data, "刷新失败，请稍后重试。"), "error");
       return;
     }
     _pluginsCache = res.data.plugins || [];
     _renderPluginListBody();
     toast("已刷新", "success");
   } catch (e) {
-    toast("刷新失败", "error");
+    if (isCurrent()) toast("刷新失败", "error");
   }
-  finally { hideLoading(); }
+  finally { if (!_uninstalling) hideLoading(); }
 }
 
 /* ============ Custom config UI (sandboxed iframe) ============ */
@@ -482,9 +577,10 @@ function _detachIframeHandler() {
   }
 }
 
-function _attachIframeHandler(plugin, schema, settings, configUi) {
+function _attachIframeHandler(plugin, schema, settings) {
   const iframe = document.getElementById("plugin-config-frame");
   if (!iframe) return;
+  let hasAutoHeight = false;
 
   const handler = async (event) => {
     // event.origin is "null" for sandboxed iframes (no allow-same-origin),
@@ -509,11 +605,14 @@ function _attachIframeHandler(plugin, schema, settings, configUi) {
       return;
     }
 
-    if (type === "resize") {
-      const heightAuto = configUi && (configUi.height === "auto" || configUi.height == null);
-      if (!heightAuto) return;
-      const h = Math.max(0, Math.floor(Number(data.height) || 0));
-      if (h > 0) iframe.style.height = `${h}px`;
+    if (type === "pawzo:config-resize" || type === "resize") {
+      // The injected bridge follows the document, including content shrinking.
+      // Prefer it over legacy plugin reporters that measure the iframe viewport.
+      if (type === "resize" && hasAutoHeight) return;
+      const h = Number(data.height);
+      if (!Number.isFinite(h) || h < 0) return;
+      if (type === "pawzo:config-resize") hasAutoHeight = true;
+      iframe.style.height = `${Math.ceil(h)}px`;
       return;
     }
 
@@ -525,12 +624,14 @@ function _attachIframeHandler(plugin, schema, settings, configUi) {
     }
 
     if (type === "save") {
+      if (_uninstalling) return;
       const correlationId = data.id;
       try {
         const res = await api.patch(
           `/api/plugins/${plugin.id}/config`,
           { settings: data.settings || {} },
         );
+        if (_uninstalling || !iframe.isConnected) return;
         if (res.status >= 400) {
           const errMsg = (res.data && res.data.error) || "保存失败";
           iframe.contentWindow.postMessage({
@@ -542,14 +643,16 @@ function _attachIframeHandler(plugin, schema, settings, configUi) {
           toast(errMsg, "error");
           return;
         }
-        // Refresh local copy so future "ready" handshakes (e.g. after a
-        // plugin reload) see the latest settings.
-        _currentPlugin = res.data.plugin;
+        // Keep this iframe's handshake data in sync after a successful save.
+        plugin = res.data.plugin;
+        schema = plugin.manifest?.config_schema || {};
+        settings = res.data.settings || {};
+        _currentPlugin = plugin;
         iframe.contentWindow.postMessage({
           type: "save-result",
           id: correlationId,
           ok: true,
-          settings: res.data.settings || {},
+          settings,
         }, "*");
         toast("配置已保存", "success");
       } catch (e) {
@@ -573,3 +676,11 @@ function _attachIframeHandler(plugin, schema, settings, configUi) {
 
 registerPageRenderer("pluginList", renderPluginList);
 registerPageRenderer("pluginDetail", renderPluginDetail);
+
+// A completed background task refreshes only the currently visible plugin page.
+window.addEventListener("pawzo:plugins-changed", event => {
+  if (_uninstalling) return;
+  const page = state.pageStack.at(-1);
+  if (page?.name === "pluginList") renderPluginList();
+  else if (page?.name === "pluginDetail" && page.data === event.detail?.plugin_id) renderPluginDetail(page.data);
+});

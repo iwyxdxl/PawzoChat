@@ -19,8 +19,41 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from pawzochat.paths import PROFILE_DIR
+
+
+@dataclass(frozen=True)
+class ProfileIdentity:
+    """Keep a saved name distinct from the UI's fallback label."""
+
+    custom_name: str | None = None
+    read_failed: bool = False
+
+    @property
+    def display_name(self) -> str:
+        return self.custom_name or "我"
+
+
+def load_profile_identity() -> ProfileIdentity:
+    """Read name and availability together, without writing profile data."""
+    path = PROFILE_DIR / "profile.json"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+    except FileNotFoundError:
+        return ProfileIdentity()
+    except (OSError, ValueError):
+        return ProfileIdentity(read_failed=True)
+    if not isinstance(profile, dict):
+        return ProfileIdentity(read_failed=True)
+    name = profile.get("name")
+    if name is None:
+        return ProfileIdentity()
+    if not isinstance(name, str):
+        return ProfileIdentity(read_failed=True)
+    return ProfileIdentity(custom_name=name.strip() or None)
 
 
 def load_profile_name() -> str:
@@ -29,13 +62,4 @@ def load_profile_name() -> str:
     Falls back to ``"我"`` when the file is missing, unreadable, or the
     ``name`` field is empty.
     """
-    path = PROFILE_DIR / "profile.json"
-    if not path.is_file():
-        return "我"
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            name = json.load(f).get("name", "我")
-    except (json.JSONDecodeError, OSError):
-        return "我"
-    name = (name or "").strip()
-    return name or "我"
+    return load_profile_identity().display_name

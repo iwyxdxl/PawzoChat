@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+import { setPromptValue } from "./prompt_textarea.js";
 import { esc, CAP_ICONS } from "./utils.js";
 import { api } from "./api.js";
 import { $, content } from "./state.js";
@@ -79,8 +80,8 @@ async function pwGenerate() {
   try {
     const r = await api.post("/api/persona-writer/generate", { provider, model, request: reqText });
     if (r.status === 200 && r.data && r.data.ok) {
-      if ($("pw-character")) $("pw-character").value = r.data.character_prompt || "";
-      if ($("pw-examples")) $("pw-examples").value = r.data.output_examples || "";
+      setPromptValue($("pw-character"), r.data.character_prompt || "");
+      setPromptValue($("pw-examples"), r.data.output_examples || "");
       const nameEl = $("pw-name");
       if (nameEl && r.data.name && !nameEl.value.trim()) nameEl.value = r.data.name;
       toast("生成完成", "success");
@@ -173,7 +174,7 @@ async function renderPersonaWriter() {
 
     <div class="card">
       <div class="card-header">生成需求</div>
-      <textarea class="form-textarea" id="pw-request" style="min-height:84px" placeholder="为我生成xxx游戏的xxx角色的人设"></textarea>
+      <div class="prompt-field"><textarea class="prompt-input" id="pw-request" placeholder="为我生成xxx游戏的xxx角色的人设"></textarea></div>
     </div>
     <div style="margin-bottom:12px">
       <button class="btn-primary" id="pw-generate-btn" onclick="PawzoChat.pwGenerate()">生成</button>
@@ -181,16 +182,16 @@ async function renderPersonaWriter() {
 
     <div class="card">
       <div class="card-header">人设设定</div>
-      <textarea class="form-textarea prompt-part" id="pw-character" placeholder="点击「生成」后自动填充，可手动编辑"></textarea>
+      <div class="prompt-field"><textarea class="prompt-input prompt-part" id="pw-character" placeholder="点击「生成」后自动填充，可手动编辑"></textarea></div>
     </div>
     <div class="card">
       <div class="card-header">输出示例</div>
-      <textarea class="form-textarea prompt-part" id="pw-examples" placeholder="点击「生成」后自动填充，可手动编辑"></textarea>
+      <div class="prompt-field"><textarea class="prompt-input prompt-part" id="pw-examples" placeholder="点击「生成」后自动填充，可手动编辑"></textarea></div>
       <div class="form-hint">用反斜线 \\ 分隔短句，例如：你已觉悟\\无需多言</div>
     </div>
     <div class="card">
       <div class="card-header">系统指令</div>
-      <textarea class="form-textarea prompt-part" id="pw-sysinstr">${esc(_pw.defaultSysInstr)}</textarea>
+      <div class="prompt-field"><textarea class="prompt-input prompt-part" id="pw-sysinstr">${esc(_pw.defaultSysInstr)}</textarea></div>
       <div class="form-hint">角色的 [系统指令] 段，已预填默认值，可修改</div>
     </div>
 

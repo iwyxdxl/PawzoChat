@@ -17,11 +17,13 @@
  */
 /* Moments (朋友圈) — feed, publish, settings */
 
+import { setPromptValue } from "./prompt_textarea.js";
+import { snapshotDraftFile } from "./draft_attachments.js";
 import { esc, iconHtml, avatarHtml, formatMsgTime, placeActionsPop } from "./utils.js";
 import { api } from "./api.js";
 import { state, $, content } from "./state.js";
 import { toast, confirm, showSheet, closeOverlay, showLoading, hideLoading } from "./ui.js";
-import { setTopBar, goBack, pushPage, registerPageRenderer } from "./navigation.js";
+import { setTopBar, goBack, pushPage, registerPageRenderer, setPageCleanup } from "./navigation.js";
 
 const BASE = () => window.PAWZOCHAT_BASE || "";
 
@@ -41,9 +43,9 @@ const _state = {
   personasById: {},      // pid -> {id, name, has_avatar}
 };
 
-const _publish = {
-  files: [],             // [{file, dataUrl}]
-};
+const newPublishDraft = () => ({ text: '', files: [], reading: 0, publishing: false, selection: null });
+let _publish = newPublishDraft(); // Session-only; files contain memory-backed File snapshots.
+let _publishEditor = null;
 
 // One floating actions popup at a time. Closing handlers are mounted lazily.
 const _pop = {
@@ -374,7 +376,6 @@ export async function momentsRefresh() {
 
 export function momentsOpenPublish() {
   if (_state.isGenerating) { toast("正在生成中…", "info"); return; }
-  _publish.files = [];
   pushPage("momentsPublish", {});
 }
 
@@ -654,11 +655,9 @@ function _openEditSheet({ kind, mid, rid, label, current, maxlen, rows }) {
           placeholder="${kind === "reply" ? "评论内容…" : "这一刻的想法…"}"
           style="min-height:${minH}px">${safeCurrent}</textarea>
       </div>
-      <div style="display:flex;gap:8px;margin-top:14px">
-        <button onclick="PawzoChat.closeOverlay()"
-          style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-        <button onclick="PawzoChat.momentsSubmitEdit()"
-          style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">保存</button>
+      <div class="form-actions" style="margin-top:14px">
+        <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+        <button class="btn-primary" onclick="PawzoChat.momentsSubmitEdit()">保存</button>
       </div>
     </div>`,
     () => { _edit.kind = null; _edit.mid = null; _edit.rid = null; },
@@ -774,7 +773,7 @@ export function momentsPickCover() {
 }
 
 export function momentsCoverMenu() {
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">朋友圈封面</div>
     <div class="card" style="margin:8px 0">
       <div class="card-row" style="cursor:pointer" onclick="PawzoChat.closeOverlay();PawzoChat.momentsPickCoverFile()">
@@ -784,7 +783,7 @@ export function momentsCoverMenu() {
         <span class="row-label" style="color:#e15151">移除封面</span>
       </div>
     </div>
-    <button onclick="PawzoChat.closeOverlay()" style="width:100%;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
+    <button class="btn-secondary btn-block" onclick="PawzoChat.closeOverlay()">取消</button>
   </div>`);
 }
 
@@ -895,16 +894,17 @@ export function momentsOnGenerating(isGenerating) {
 /* ---- Publish page ---- */
 
 function renderMomentsPublish() {
+  const draft = _publish;
   _list.inListPage = false;
   setTopBar("发布朋友圈", true, `
-    <button class="btn-text" onclick="PawzoChat.momentsSubmitPublish()" style="font-size:15px;font-weight:500;padding:8px 8px">发表</button>
+    <button class="btn-text" id="m-pub-submit" onclick="PawzoChat.momentsSubmitPublish()">发表</button>
   `);
 
   content().innerHTML = `
     <input type="file" id="m-pub-file" accept="image/*" multiple style="display:none" onchange="PawzoChat.momentsOnPublishFiles(event)">
     <div class="page moments-publish-page">
       <div class="card">
-        <textarea id="m-pub-text" class="form-textarea" rows="6" placeholder="这一刻的想法…" style="width:100%;border:none;background:transparent;font-size:15px;line-height:1.6;color:var(--text-1);resize:vertical;padding:14px 16px;font-family:var(--font);outline:none"></textarea>
+        <textarea id="m-pub-text" class="form-textarea" rows="6" placeholder="这一刻的想法…"></textarea>
       </div>
       <div class="card">
         <div class="moments-pub-imgs" id="m-pub-imgs"></div>
@@ -912,73 +912,108 @@ function renderMomentsPublish() {
       </div>
     </div>
   `;
+  const input = $('m-pub-text');
+  const editor = _publishEditor = { draft, input };
+  input.value = draft.text;
+  input.addEventListener('input', () => { draft.text = input.value; });
+  if (draft.selection) input.setSelectionRange(...draft.selection);
+  setPageCleanup(() => {
+    draft.text = input.value;
+    draft.selection = [input.selectionStart, input.selectionEnd, input.selectionDirection];
+    if (_publishEditor === editor) _publishEditor = null;
+  });
   _renderPublishImages();
 }
 
 function _renderPublishImages() {
   const host = $("m-pub-imgs");
-  if (!host) return;
-  const thumbs = _publish.files.map((f, i) => `
+  if (!host || !_publishEditor) return;
+  const draft = _publishEditor.draft;
+  $('m-pub-submit').disabled = draft.publishing || draft.reading > 0;
+  _publishEditor.input.disabled = draft.publishing;
+  const disabled = draft.publishing ? ' disabled' : '';
+  const thumbs = draft.files.map((f, i) => `
     <div class="m-pub-thumb" style="background-image:url('${f.dataUrl}')">
-      <button class="m-pub-thumb-del" onclick="PawzoChat.momentsRemovePubImage(${i})">×</button>
+      <button class="m-pub-thumb-del"${disabled} onclick="PawzoChat.momentsRemovePubImage(${i})">×</button>
     </div>
   `).join("");
-  const addBtn = _publish.files.length < 9
-    ? `<button class="m-pub-add" onclick="PawzoChat.momentsPickPubImages()">+</button>`
+  const addBtn = draft.files.length + draft.reading < 9
+    ? `<button class="m-pub-add"${disabled} onclick="PawzoChat.momentsPickPubImages()">+</button>`
     : "";
   host.innerHTML = thumbs + addBtn;
 }
 
 export function momentsPickPubImages() {
+  if (_publish.publishing) return;
   const inp = $("m-pub-file");
   if (inp) { inp.value = ""; inp.click(); }
 }
 
 export async function momentsOnPublishFiles(event) {
+  if (!_publishEditor || _publish.publishing || event.target !== $('m-pub-file')) return;
+  const draft = _publish;
   const files = Array.from(event.target.files || []);
+  event.target.value = "";
   if (!files.length) return;
-  const remaining = Math.max(0, 9 - _publish.files.length);
+  const remaining = Math.max(0, 9 - draft.files.length - draft.reading);
   if (!remaining) {
     toast("已达到 9 张图片上限", "info");
-    event.target.value = "";
     return;
   }
   const accepted = files.slice(0, remaining);
   if (files.length > remaining) toast(`仅添加前 ${remaining} 张图片`, "info");
-  for (const file of accepted) {
-    if (file.size > 10 * 1024 * 1024) {
-      toast(`「${file.name}」超过 10 MB`, "error");
-      continue;
-    }
-    const dataUrl = await new Promise(resolve => {
-      const fr = new FileReader();
-      fr.onload = () => resolve(fr.result);
-      fr.onerror = () => resolve("");
-      fr.readAsDataURL(file);
-    });
-    if (dataUrl) _publish.files.push({ file, dataUrl });
-  }
+  draft.reading += accepted.length;
   _renderPublishImages();
-  event.target.value = "";
+  for (const file of accepted) {
+    try {
+      if (!file.type.startsWith('image/')) {
+        toast(`「${file.name}」不是图片`, 'error');
+        continue;
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        toast(`「${file.name}」超过 10 MB`, "error");
+        continue;
+      }
+      const snapshot = await snapshotDraftFile(file);
+      const dataUrl = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(fr.result);
+        fr.onerror = fr.onabort = () => reject(fr.error || new Error('读取失败'));
+        fr.readAsDataURL(snapshot);
+      });
+      draft.files.push({ file: snapshot, dataUrl });
+    } catch {
+      // Unreadable local files are silently omitted from the draft.
+    } finally {
+      draft.reading--;
+      if (_publishEditor?.draft === draft) _renderPublishImages();
+    }
+  }
 }
 
 export function momentsRemovePubImage(idx) {
+  if (!_publishEditor || _publish.publishing) return;
   _publish.files.splice(idx, 1);
   _renderPublishImages();
 }
 
 export async function momentsSubmitPublish() {
-  const text = ($("m-pub-text")?.value || "").trim();
-  if (!text && _publish.files.length === 0) {
+  const editor = _publishEditor, draft = _publish;
+  if (!editor || editor.draft !== draft || draft.publishing || draft.reading) return;
+  draft.text = editor.input.value;
+  const text = draft.text.trim();
+  if (!text && draft.files.length === 0) {
     toast("文案与图片不能同时为空", "error");
     return;
   }
-  const fd = new FormData();
-  fd.append("text", text);
-  for (const f of _publish.files) fd.append("images", f.file);
-
+  draft.publishing = true;
+  _renderPublishImages();
   showLoading("发布中…");
   try {
+    const fd = new FormData();
+    fd.append("text", text);
+    // Selection already captured every byte; these files no longer depend on disk.
+    for (const { file } of draft.files) fd.append("images", file);
     const r = await fetch(`${BASE()}/api/moments`, { method: "POST", body: fd });
     const data = await r.json();
     if (r.status >= 400) {
@@ -986,10 +1021,15 @@ export async function momentsSubmitPublish() {
       return;
     }
     toast("已发布", "success");
-    _publish.files = [];
-    goBack();
-  } catch (e) { toast("发布失败", "error"); }
-  finally { hideLoading(); }
+    _publish = newPublishDraft();
+    // A response from an old page must not navigate away from the current page.
+    if (_publishEditor?.draft === draft) goBack();
+  } catch (e) { toast("发布失败，草稿已保留", "error"); }
+  finally {
+    draft.publishing = false;
+    if (_publishEditor?.draft === draft) _renderPublishImages();
+    hideLoading();
+  }
 }
 
 /* ---- Settings page ---- */
@@ -1037,8 +1077,8 @@ async function renderMomentsSettings() {
           <span class="card-header" style="flex:1">文案生成提示词</span>
           <button class="btn-text btn-sm" onclick="PawzoChat.momentsResetPrompt('post')">恢复默认</button>
         </div>
-        <div class="form-group" style="padding:0 16px 14px">
-          <textarea id="m-set-post" class="form-textarea moments-prompt-area" rows="6">${esc(_settings.promptPost)}</textarea>
+        <div class="prompt-field">
+          <textarea id="m-set-post" class="prompt-input" rows="6">${esc(_settings.promptPost)}</textarea>
           <div class="form-hint">刷新朋友圈时调用 LLM 的指令模板</div>
         </div>
       </div>
@@ -1047,8 +1087,8 @@ async function renderMomentsSettings() {
           <span class="card-header" style="flex:1">回复生成提示词</span>
           <button class="btn-text btn-sm" onclick="PawzoChat.momentsResetPrompt('reply')">恢复默认</button>
         </div>
-        <div class="form-group" style="padding:0 16px 14px">
-          <textarea id="m-set-reply" class="form-textarea moments-prompt-area" rows="6">${esc(_settings.promptReply)}</textarea>
+        <div class="prompt-field">
+          <textarea id="m-set-reply" class="prompt-input" rows="6">${esc(_settings.promptReply)}</textarea>
           <div class="form-hint">可用占位符：<code>{author}</code>（发布者名字）、<code>{text}</code>（朋友圈正文）</div>
         </div>
       </div>
@@ -1057,8 +1097,8 @@ async function renderMomentsSettings() {
           <span class="card-header" style="flex:1">反向回复提示词</span>
           <button class="btn-text btn-sm" onclick="PawzoChat.momentsResetPrompt('counter_reply')">恢复默认</button>
         </div>
-        <div class="form-group" style="padding:0 16px 14px">
-          <textarea id="m-set-counter" class="form-textarea moments-prompt-area" rows="6">${esc(_settings.promptCounterReply)}</textarea>
+        <div class="prompt-field">
+          <textarea id="m-set-counter" class="prompt-input" rows="6">${esc(_settings.promptCounterReply)}</textarea>
           <div class="form-hint">用户回复角色时使用。可用占位符：<code>{moment_author}</code>、<code>{moment_text}</code>、<code>{user_name}</code>、<code>{user_reply}</code>、<code>{thread}</code>（之前的对话）</div>
         </div>
       </div>
@@ -1123,13 +1163,13 @@ export function momentsOnProbInput(input) {
 export function momentsResetPrompt(kind) {
   if (kind === "post") {
     const el = $("m-set-post");
-    if (el) el.value = _settings.promptPostDefault;
+    setPromptValue(el, _settings.promptPostDefault);
   } else if (kind === "counter_reply") {
     const el = $("m-set-counter");
-    if (el) el.value = _settings.promptCounterReplyDefault;
+    setPromptValue(el, _settings.promptCounterReplyDefault);
   } else {
     const el = $("m-set-reply");
-    if (el) el.value = _settings.promptReplyDefault;
+    setPromptValue(el, _settings.promptReplyDefault);
   }
 }
 

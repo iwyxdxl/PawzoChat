@@ -161,7 +161,10 @@ def _decode_payload(payload: str | bytes) -> bytes | None:
         return None
 
 
-def _save_image(persona_id: str, payload: str | bytes, mime: str) -> dict | None:
+def _save_image(
+    persona_id: str, payload: str | bytes, mime: str,
+    *, media_dir: Path | None = None,
+) -> dict | None:
     """Decode + write one image; return ``{path, mime, filename}`` or None.
 
     The caller-supplied *mime* is informational only — the actual file
@@ -193,7 +196,9 @@ def _save_image(persona_id: str, payload: str | bytes, mime: str) -> dict | None
         return None
 
     normalized_mime, ext = detected
-    out_dir = _safe_persona_images_dir(persona_id)
+    # media_dir is supplied by the host, never by tool arguments. Group callers
+    # own this staging root and move the finished turn's files on commit.
+    out_dir = (Path(media_dir).resolve() / "images") if media_dir is not None else _safe_persona_images_dir(persona_id)
     if out_dir is None:
         return None
 
@@ -216,6 +221,7 @@ def _extract_from_text(
     persona_id: str, text: str,
     *,
     remaining: int,
+    media_dir: Path | None = None,
 ) -> tuple[str, list[dict], int]:
     """Find data URIs in *text*; save each, return sanitized text + saved entries."""
     saved: list[dict] = []
@@ -226,7 +232,7 @@ def _extract_from_text(
         if len(saved) >= remaining:
             skipped += 1
             return "(图片数量超过上限)"
-        entry = _save_image(persona_id, match.group(2), match.group(1))
+        entry = _save_image(persona_id, match.group(2), match.group(1), media_dir=media_dir)
         if entry:
             saved.append(entry)
             return "(图片已发送给用户)"
@@ -243,8 +249,12 @@ def extract_mcp_images(
     blocks: list[ContentBlock],
     *,
     persona_id: str,
+    media_dir: Path | None = None,
 ) -> tuple[list[dict], list[ContentBlock]]:
     """Pull image payloads out of MCP tool result blocks.
+
+    ``media_dir`` is an optional host-owned staging root. Omitting it keeps
+    the existing private-chat image directory for the supplied persona.
 
     Returns ``(saved, rewritten)``:
 
@@ -272,6 +282,7 @@ def extract_mcp_images(
                 continue
             entry = _save_image(
                 persona_id, block.data, block.mime_type or "image/png",
+                media_dir=media_dir,
             )
             if entry is None:
                 # Decode/verify failed — drop the broken image block
@@ -289,6 +300,7 @@ def extract_mcp_images(
             remaining = _MAX_IMAGES_PER_RESULT - len(saved)
             new_text, extracted, extra_skipped = _extract_from_text(
                 persona_id, block.text, remaining=remaining,
+                media_dir=media_dir,
             )
             saved.extend(extracted)
             skipped += extra_skipped

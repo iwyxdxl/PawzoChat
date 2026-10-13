@@ -54,8 +54,3 @@ def verify_password(password: str, stored: str) -> bool:
     except (ValueError, OverflowError):
         return False
     return hmac.compare_digest(dk.hex(), hash_hex)
-
-
-def is_hashed(value: str) -> bool:
-    """Return True if *value* looks like a hashed password (not plaintext)."""
-    return value.startswith(_PREFIX)

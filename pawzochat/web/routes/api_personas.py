@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import io
 import json
 import logging
@@ -119,6 +120,30 @@ def _name_exists(personas_cfg: dict, name: str, *, exclude_id: str = "") -> bool
     return False
 
 
+def _validate_group_reads(app, persona_id: str, value) -> str | None:
+    """Allow current sources and unchanged preferences for deleted archives."""
+    if not isinstance(value, dict) or any(
+        not isinstance(gid, str) or not gid or not isinstance(enabled, bool)
+        for gid, enabled in value.items()
+    ):
+        return "group_reads 必须是群 ID 与布尔值组成的对象"
+    service = getattr(app, "group_memory_service", None)
+    saved = app.config.get("personas", default={}).get(persona_id, {}).get("memory", {}).get("group_reads", {})
+    if not isinstance(saved, dict):
+        saved = {}
+    try:
+        unknown_source = any(
+            not (service is not None and service.has_source(gid, persona_id))
+            and saved.get(gid) is not enabled
+            for gid, enabled in value.items()
+        )
+    except ValueError:
+        unknown_source = True
+    if unknown_source:
+        return "群记忆来源不存在或不属于当前角色"
+    return None
+
+
 # Long prompt fields persisted in data/prompts/<id>.json instead of config.yaml,
 # so config stays an index for short metadata only and prompts are unbounded.
 _IMAGE_PROMPT_KEYS = ("style_prefix", "art_style", "negative_prompt")
@@ -194,8 +219,10 @@ def _validate_voice_generation(app, patch: dict) -> tuple[str | None, dict]:
     return None, normalized
 
 
-def _set_custom_reference_image(persona_id: str, cfg: dict, raw: bytes | None) -> None:
-    """Persist or clear the persona's custom reference image and config."""
+def _set_custom_reference_image(
+    persona_id: str, cfg: dict, raw: bytes | None, *, activate: bool = True,
+) -> None:
+    """Persist or clear a reference image; imports keep the saved reference mode."""
     ig = normalize_image_generation(cfg.get("image_generation"))
     if raw is None:
         delete_custom_reference_image(persona_id)
@@ -204,7 +231,8 @@ def _set_custom_reference_image(persona_id: str, cfg: dict, raw: bytes | None) -
         ig["custom_ref_filename"] = ""
     else:
         save_custom_reference_image(persona_id, raw)
-        ig["ref_mode"] = "custom"
+        if activate:
+            ig["ref_mode"] = "custom"
         ig["custom_ref_filename"] = CUSTOM_REFERENCE_FILENAME
     cfg["image_generation"] = _ig_metadata(ig)
 
@@ -284,6 +312,12 @@ def create_persona():
     err = _validate_persona_name(name)
     if err:
         return jsonify({"error": err}), 400
+    mem_input = data.get("memory", {})
+    if not isinstance(mem_input, dict):
+        return jsonify({"error": "memory 必须是 JSON 对象"}), 400
+    group_reads = mem_input.get("group_reads", {})
+    if not isinstance(group_reads, dict) or group_reads:
+        return jsonify({"error": "新角色尚无可配置的群记忆来源"}), 400
 
     with app.config.lock:
         personas_cfg = app.config.get("personas", default={})
@@ -315,7 +349,6 @@ def create_persona():
             system_instructions=system_instr,
         )
 
-        mem_input = data.get("memory", {})
         trigger_mode = mem_input.get("trigger_mode", "remind")
         if trigger_mode not in ("remind", "summarize", "summarize_only"):
             return jsonify({"error": "trigger_mode 必须是 remind、summarize 或 summarize_only"}), 400
@@ -331,6 +364,7 @@ def create_persona():
                 "include_in_prompt": bool(mem_input.get("include_in_prompt", True)),
                 "trigger_rounds": trigger_rounds,
                 "trigger_mode": trigger_mode,
+                "group_reads": {},
             }
         except (TypeError, ValueError):
             return jsonify({"error": "memory 配置字段类型无效"}), 400
@@ -385,6 +419,17 @@ def create_persona():
 def update_persona(persona_id: str):
     app = get_app()
     data = request.get_json(force=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "请求内容必须是 JSON 对象"}), 400
+    if persona_id not in app.config.get("personas", default={}):
+        return jsonify({"error": "Persona not found"}), 404
+    mem_patch = data.get("memory")
+    if isinstance(mem_patch, dict) and "group_reads" in mem_patch:
+        # Source lookup may take group/archive locks; do it before taking the
+        # config lock, whose callers also include background group workers.
+        error = _validate_group_reads(app, persona_id, mem_patch["group_reads"])
+        if error:
+            return jsonify({"error": error}), 400
 
     with app.config.lock:
         personas_cfg = app.config.get("personas", default={})
@@ -392,7 +437,10 @@ def update_persona(persona_id: str):
         if persona_id not in personas_cfg:
             return jsonify({"error": "Persona not found"}), 404
 
-        cfg = personas_cfg[persona_id]
+        # Validate the whole form before publishing any in-memory settings.
+        # A later voice/image validation error must not change memory gates or
+        # trigger parameters without notifying the group memory worker.
+        cfg = deepcopy(personas_cfg[persona_id])
         old_name = cfg.get("name", "")
 
         new_name = data.get("name", "").strip() if "name" in data else old_name
@@ -421,11 +469,13 @@ def update_persona(persona_id: str):
             cfg["emoji_group"] = data["emoji_group"]
 
         summarize_activated = False
+        group_memory_settings_changed = False
         if "memory" in data:
             mem_patch = data["memory"]
             if not isinstance(mem_patch, dict):
                 return jsonify({"error": "memory 必须是 JSON 对象"}), 400
             existing_mem = dict(cfg.get("memory", {}))
+            previous_mem = dict(existing_mem)
             old_summarize = auto_summary_enabled(existing_mem)
             if "enabled" in mem_patch:
                 existing_mem["enabled"] = bool(mem_patch["enabled"])
@@ -448,6 +498,17 @@ def update_persona(persona_id: str):
                 if mem_patch["trigger_mode"] not in ("remind", "summarize", "summarize_only"):
                     return jsonify({"error": "trigger_mode 必须是 remind、summarize 或 summarize_only"}), 400
                 existing_mem["trigger_mode"] = mem_patch["trigger_mode"]
+            if "group_reads" in mem_patch:
+                previous_reads = existing_mem.get("group_reads", {})
+                existing_mem["group_reads"] = {
+                    **(previous_reads if isinstance(previous_reads, dict) else {}),
+                    **mem_patch["group_reads"],
+                }
+            group_memory_settings_changed = any(
+                previous_mem.get(key, default) != existing_mem.get(key, default)
+                for key, default in (("trigger_mode", "remind"), ("trigger_rounds", 10),
+                                     ("max_memories", 50))
+            )
             cfg["memory"] = existing_mem
             # Auto-summarization newly became effective (enabled/trigger_rounds/
             # trigger_mode turned it on). Reset the summary cursor to the
@@ -536,6 +597,7 @@ def update_persona(persona_id: str):
                 system_instructions=data.get("system_instructions", cur_s),
             )
 
+        personas_cfg[persona_id] = cfg
         app.config._data["personas"] = personas_cfg
         app.config.save()
 
@@ -547,6 +609,13 @@ def update_persona(persona_id: str):
             app.memory_service.reset_summary_cursor(persona_id)
         except Exception:
             logger.warning("重置总结游标失败 persona=%s", persona_id, exc_info=True)
+    if group_memory_settings_changed:
+        service = getattr(app, "group_memory_service", None)
+        if service is not None:
+            try:
+                service.settings_changed(persona_id)
+            except Exception:
+                logger.warning("更新群记忆设置失败 persona=%s", persona_id, exc_info=True)
     return jsonify({"ok": True})
 
 
@@ -554,21 +623,50 @@ def update_persona(persona_id: str):
 def delete_persona(persona_id: str):
     app = get_app()
     delete_conv = request.args.get("delete_conversation", "").lower() == "true"
+    group_memory = getattr(app, "group_memory_service", None)
 
     with app.config.lock:
         personas_cfg = app.config.get("personas", default={})
 
         if persona_id not in personas_cfg:
-            return jsonify({"error": "Persona not found"}), 404
+            if group_memory is None or not group_memory.persona_deletion_pending(persona_id):
+                return jsonify({"error": "Persona not found"}), 404
+        else:
+            previous = deepcopy(app.config._data)
+            try:
+                # No group locks here: the intent survives a crash after the
+                # config deletion, while group cleanup runs outside this lock.
+                if group_memory is not None:
+                    group_memory.begin_persona_deletion(persona_id)
+                del personas_cfg[persona_id]
+                app.config._data["personas"] = personas_cfg
+                _unenroll_persona_from_moments(app, persona_id)
+                app.config.save()
+            except OSError:
+                app.config._data = previous
+                logger.exception("删除角色配置失败 persona=%s", persona_id)
+                return jsonify({"error": "角色删除失败，请检查存储后重试。"}), 503
 
-        del personas_cfg[persona_id]
-        app.config._data["personas"] = personas_cfg
-        _unenroll_persona_from_moments(app, persona_id)
-        app.config.save()
+    cleanup_failed = False
+    try:
+        app.config.prompt_path(persona_id).unlink(missing_ok=True)
+    except OSError:
+        cleanup_failed = True
+        logger.exception("清理角色人设失败 persona=%s", persona_id)
 
-    json_path = app.config.prompt_path(persona_id)
-    if json_path.is_file():
-        json_path.unlink()
+    group_service = getattr(app, "group_chat_service", None)
+    try:
+        if group_service is not None:
+            group_service.remove_persona(persona_id)
+    except Exception:
+        cleanup_failed = True
+        logger.exception("清理角色群成员配置失败 persona=%s", persona_id)
+    try:
+        if group_memory is not None:
+            group_memory.finish_persona_deletion(persona_id)
+    except OSError:
+        cleanup_failed = True
+        logger.exception("清理角色群记忆失败 persona=%s", persona_id)
 
     # Clean up all moments and replies from this persona.
     try:
@@ -579,6 +677,8 @@ def delete_persona(persona_id: str):
     if delete_conv:
         app.conversation_store.delete_conversation(persona_id)
 
+    if cleanup_failed:
+        return jsonify({"error": "角色已删除，部分数据清理未完成，请检查存储后重试；未完成的群记忆清理将在重启时继续。"}), 503
     return jsonify({"ok": True})
 
 
@@ -747,7 +847,6 @@ def _persona_config_from_card_result(
     }
     image_generation = normalize_image_generation(result.image_generation)
     if result.reference_image_png is not None:
-        image_generation["ref_mode"] = "custom"
         image_generation["custom_ref_filename"] = CUSTOM_REFERENCE_FILENAME
     return {
         "name": name,
@@ -909,12 +1008,19 @@ def import_persona():
                 persona_id,
                 character_prompt=character_prompt,
                 output_examples=output_examples,
-                system_instructions=system_instructions or DEFAULT_SYSTEM_INSTRUCTIONS,
+                system_instructions=(
+                    system_instructions if result.has_system_instructions
+                    else DEFAULT_SYSTEM_INSTRUCTIONS
+                ),
             )
             created_persona_dir = True
 
             # Image prompt sections live in the same prompt file; metadata stays in yaml.
-            ig_full = normalize_image_generation(persona_cfg.get("image_generation"))
+            ig_raw = persona_cfg.get("image_generation")
+            ig_raw = ig_raw if isinstance(ig_raw, dict) else {}
+            ig_full = normalize_image_generation(ig_raw)
+            if reference_image_png is not None and "ref_mode" not in ig_raw:
+                ig_full["ref_mode"] = "custom"
             _persist_image_prompts(app, persona_id, ig_full)
             persona_cfg["image_generation"] = _ig_metadata(ig_full)
 
@@ -923,7 +1029,7 @@ def import_persona():
                 created_persona_dir = True
 
             if reference_image_png is not None:
-                _set_custom_reference_image(persona_id, persona_cfg, reference_image_png)
+                _set_custom_reference_image(persona_id, persona_cfg, reference_image_png, activate=False)
                 created_persona_dir = True
 
             # Books — create and remember the (possibly renamed) final names.

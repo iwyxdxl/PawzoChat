@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import signal
 import sys
@@ -31,15 +30,18 @@ from pawzochat.channels.web import WebChannel
 from pawzochat.channels.wechat import WeChatChannel
 from pawzochat.core.config import ConfigManager
 from pawzochat.core.extensions.manager import ExtensionManager
+from pawzochat.core.extensions.installer import PluginInstaller
 from pawzochat.image.manager import ImageManager
 from pawzochat.voice.manager import VoiceManager
 from pawzochat.llm.manager import LLMManager
 from pawzochat.mcp.adapters import CapabilityAdapterRegistry
 from pawzochat.mcp.manager import MCPManager
-from pawzochat.paths import BINDINGS_PATH, CERTS_DIR
+from pawzochat.paths import CERTS_DIR
 from pawzochat.services.chat import ChatService
+from pawzochat.services.group_chat import GroupChatService
 from pawzochat.services.emoji import EmojiService
 from pawzochat.services.memory import MemoryService
+from pawzochat.services.group_memory import GroupMemoryService
 from pawzochat.services.message_queue import MessageQueue
 from pawzochat.services.moments import MomentsService
 from pawzochat.services.proactive import ProactiveService
@@ -47,6 +49,7 @@ from pawzochat.services.reply_dispatcher import ReplyDispatcher
 from pawzochat.services.telemetry import TelemetryService
 from pawzochat.services.worldbook import WorldbookService
 from pawzochat.store.conversation import ConversationStore
+from pawzochat.store.group_conversation import GroupConversationStore
 from pawzochat.store.moments import MomentsStore
 from pawzochat.transport.auth import AuthManager
 from pawzochat.transport.models import Account
@@ -62,6 +65,7 @@ class App:
     def __init__(self):
         self.config = ConfigManager()
         self.conversation_store = ConversationStore()
+        self.group_store = GroupConversationStore()
         self.moments_store = MomentsStore()
         self.llm_manager = LLMManager()
         self.image_manager = ImageManager()
@@ -74,10 +78,13 @@ class App:
             self.llm_manager,
             mcp_manager=self.mcp_manager,
         )
+        self.installer = PluginInstaller(self.extension_manager, self.config)
         self.capability_registry: CapabilityAdapterRegistry | None = None
         self.memory_service: MemoryService | None = None
+        self.group_memory_service: GroupMemoryService | None = None
         self.worldbook_service: WorldbookService | None = None
         self.chat_service: ChatService | None = None
+        self.group_chat_service: GroupChatService | None = None
         self.emoji_service: EmojiService | None = None
         self.message_queue: MessageQueue | None = None
         self.reply_dispatcher: ReplyDispatcher | None = None
@@ -114,6 +121,11 @@ class App:
         logger.info("  PawzoChat 启动中…")
         logger.info("=" * 50)
 
+        # Recover before any plugin discovery; logging is already available
+        # so a failed recovery leaves actionable diagnostics.
+        self.installer.configure()
+        self.installer.startup_cleanup()
+
         self.llm_manager.init_from_config(self.config.get("llm_providers", default={}))
         if not self.llm_manager.available_providers:
             logger.warning("没有配置有效的对话 Provider — 请在设置-对话服务商中添加")
@@ -129,9 +141,6 @@ class App:
             logger.info(
                 "已加载 %d 个语音 Provider", len(self.voice_manager.available_providers),
             )
-
-        self._migrate_bindings()
-        self._migrate_password()
 
         mcp_cfg = self.config.get("mcp_servers", default={})
         if mcp_cfg:
@@ -194,6 +203,10 @@ class App:
             store=self.conversation_store,
             llm_manager=self.llm_manager,
         )
+        self.group_memory_service = GroupMemoryService(
+            config=self.config, group_store=self.group_store,
+            private_memory_service=self.memory_service,
+        )
 
         self.worldbook_service = WorldbookService(config=self.config)
 
@@ -205,12 +218,14 @@ class App:
             capability_registry=self.capability_registry,
             extension_manager=self.extension_manager,
             memory_service=self.memory_service,
+            group_memory_service=self.group_memory_service,
             worldbook_service=self.worldbook_service,
             image_manager=self.image_manager,
             voice_manager=self.voice_manager,
         )
 
         self.emoji_service = EmojiService(self.config, self.llm_manager)
+        self.group_chat_service = GroupChatService(self)
         self.moments_service = MomentsService(self)
         self.reply_dispatcher = ReplyDispatcher(self)
         self.message_queue = MessageQueue(self)
@@ -219,6 +234,7 @@ class App:
         self.channel_registry.register(QQChannel(self))
         self.proactive_service = ProactiveService(self)
         self.extension_manager.start()
+        self.installer.start_update_checker()
         self.message_queue.start()
         self.proactive_service.start()
         self.moments_service.start()
@@ -259,6 +275,7 @@ class App:
         wd = threading.Timer(5.0, _watchdog)
         wd.daemon = True
         wd.start()
+        self.installer.stop()
 
         # Best-effort offline notify, fired FIRST and concurrently (no join) so
         # they get maximum wall-clock before exit without serializing N×timeout
@@ -268,13 +285,18 @@ class App:
 
         if self.telemetry:
             self.telemetry.stop()
+        if self.group_chat_service:
+            self.group_chat_service.shutdown()
         for srv in self._web_servers:
             try:
                 srv.stop()
             except Exception:
                 logger.debug("Web server stop error", exc_info=True)
         for channel in self.channel_registry.all():
-            channel.shutdown()
+            # Plugin channels are stopped with their runtime under the manager
+            # transaction lock, after callback admission has been closed.
+            if not channel.channel_type.startswith("plugin:"):
+                channel.shutdown()
         if self.proactive_service:
             self.proactive_service.stop()
         if self.moments_service:
@@ -299,6 +321,7 @@ class App:
         ensure_listen_port_free(port, "127.0.0.1", label="本地面板")
 
         flask_app = create_app(self)
+        flask_app.config["LOCAL_LISTEN_PORT"] = port
 
         local_server = WSGIServer(("127.0.0.1", port), flask_app)
         self._web_servers.append(local_server)
@@ -435,58 +458,3 @@ class App:
                     channel.start_account(acc)
                 except Exception:
                     logger.exception("延迟启动账号失败: %s", acc.bot_id)
-
-    # ---- Data migration ----
-
-    def _migrate_password(self):
-        """Auto-migrate plaintext password to hashed form in config."""
-        from pawzochat.utils.crypto import hash_password, is_hashed
-
-        pw = self.config.get("web", "password", default="")
-        if pw and not is_hashed(pw):
-            self.config._data.setdefault("web", {})["password"] = hash_password(pw)
-            self.config.save()
-            logger.info("明文密码已自动迁移为哈希存储")
-
-    def _migrate_bindings(self):
-        """One-time migration from bindings.json to conversation-based wechat_link."""
-        if not BINDINGS_PATH.exists():
-            return
-
-        logger.info("检测到 bindings.json，开始迁移…")
-        try:
-            with open(BINDINGS_PATH, "r", encoding="utf-8") as f:
-                bindings = json.load(f)
-        except Exception:
-            logger.exception("读取 bindings.json 失败，跳过迁移")
-            return
-
-        migrated = 0
-        for account_id, acc_data in bindings.get("accounts", {}).items():
-            for user_id, user_data in acc_data.get("users", {}).items():
-                persona_id = user_data.get("persona_id", "")
-                context_token = user_data.get("context_token", "")
-                if not persona_id:
-                    continue
-
-                self.conversation_store.ensure_conversation(persona_id)
-                try:
-                    self.conversation_store.set_channel_link(
-                        persona_id, account_id,
-                        channel="wechat", reply_target=context_token,
-                    )
-                    migrated += 1
-                    logger.info(
-                        "迁移绑定: account=%s → persona=%s",
-                        account_id[:12], persona_id,
-                    )
-                except ValueError:
-                    logger.warning(
-                        "迁移跳过(账号已被占用): account=%s persona=%s",
-                        account_id[:12], persona_id,
-                    )
-                break
-
-        backup_path = BINDINGS_PATH.with_suffix(".json.bak")
-        BINDINGS_PATH.rename(backup_path)
-        logger.info("bindings.json 迁移完成 (%d 条)，已备份为 %s", migrated, backup_path)

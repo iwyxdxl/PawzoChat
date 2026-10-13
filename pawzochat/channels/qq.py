@@ -434,8 +434,8 @@ class QQChannel(Channel):
                 playable, ext, mime, duration_ms = normalize_inbound_audio(raw)
                 save_path = voice_dir / f"voice_{secrets.token_hex(4)}{ext}"
                 save_path.write_bytes(playable)
-            except Exception:
-                logger.exception("[QQ] 语音下载或转码失败: %s", source_url[:80])
+            except Exception as exc:
+                logger.warning("[QQ] 语音下载或转码失败 (%s)", type(exc).__name__)
                 failed.append(transcript)
                 continue
             result.append({
@@ -526,8 +526,8 @@ class QQChannel(Channel):
             return None
         try:
             return self._fetch_url(att.url, max_bytes)
-        except Exception:
-            logger.exception("[QQ] 下载%s失败: %s", label, att.url[:80])
+        except Exception as exc:
+            logger.warning("[QQ] 下载%s失败 (%s)", label, type(exc).__name__)
             return None
 
     @staticmethod
@@ -698,10 +698,7 @@ class QQChannel(Channel):
                 file_name=Path(path).name if file_type == FILE_TYPE_FILE else "",
                 on_progress=self._upload_progress(reply_key[0], path),
             )
-            file_info = uploaded.get("file_info", "")
-            if not file_info:
-                logger.warning("[QQ] 上传未返回 file_info: %s", uploaded)
-                return False
+            file_info = uploaded["file_info"]
             reply_msg_id, msg_seq = self._next_reply_params(reply_key)
             active = not reply_msg_id
             response = client.send_c2c_message(
@@ -762,10 +759,7 @@ class QQChannel(Channel):
                 openid, silk_bytes, file_type=FILE_TYPE_AUDIO,
                 on_progress=self._upload_progress(reply_key[0], path),
             )
-            file_info = uploaded.get("file_info", "")
-            if not file_info:
-                logger.warning("[QQ] 语音上传未返回 file_info: %s", uploaded)
-                return False
+            file_info = uploaded["file_info"]
             reply_msg_id, msg_seq = self._next_reply_params(reply_key)
             active = not reply_msg_id
             response = client.send_c2c_message(

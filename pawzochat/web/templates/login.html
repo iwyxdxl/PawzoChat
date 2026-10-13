@@ -27,18 +27,12 @@
 <link rel="stylesheet" href="{{ request.script_root }}/static/style.css">
 <style>
   body { display:flex; justify-content:center; align-items:center; min-height:100vh; margin:0; padding-bottom:18vh; background:var(--bg); }
-  .login-box { width:320px; text-align:center; }
+  .login-box { width:min(320px, calc(100vw - 32px)); text-align:center; }
   .login-logo { width:72px; height:72px; margin:0 auto 8px; }
   .login-title { font-size:20px; font-weight:600; color:var(--text); margin-bottom:4px; }
-  .login-subtitle { font-size:13px; color:var(--text-secondary); margin-bottom:32px; }
-  .login-input { width:100%; box-sizing:border-box; padding:12px 16px; border:1px solid var(--border);
-    border-radius:10px; font-size:15px; background:var(--card); color:var(--text); outline:none; }
-  .login-input:focus { border-color:var(--primary); }
-  .login-btn { width:100%; padding:12px; margin-top:16px; border:none; border-radius:10px;
-    background:var(--primary); color:#fff; font-size:16px; font-weight:500; cursor:pointer; }
-  .login-btn:active { opacity:.85; }
-  .login-btn:disabled { opacity:.7; cursor:default; }
-  .login-error { color:#e74c3c; font-size:13px; margin-top:12px; }
+  .login-subtitle { font-size:13px; color:var(--text-2); margin-bottom:32px; }
+  .login-btn { margin-top:16px; }
+  .login-error { color:var(--danger); font-size:13px; margin-top:12px; }
 </style>
 </head>
 <body>
@@ -47,8 +41,8 @@
   <div class="login-logo"><img src="{{ request.script_root }}/static/logo.png" alt="PawzoChat" style="width:100%;height:100%;border-radius:16px"></div>
   <div class="login-title">PawzoChat</div>
   <div class="login-subtitle">请输入访问密码</div>
-  <input class="login-input" type="password" name="password" placeholder="密码" autofocus autocomplete="current-password">
-  <button class="login-btn" type="submit">登录</button>
+  <input class="form-input login-input" type="password" name="password" placeholder="密码" autofocus autocomplete="current-password">
+  <button class="btn-primary login-btn" type="submit">登录</button>
   {% if error %}<div class="login-error">{{ error }}</div>{% endif %}
 </form>
 <script>

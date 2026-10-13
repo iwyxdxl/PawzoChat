@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import logging
 import secrets
+import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
+from functools import wraps
 from typing import TYPE_CHECKING
 
 from pawzochat.channels.base import Channel
@@ -37,6 +39,25 @@ if TYPE_CHECKING:
     from pawzochat.app import App
 
 logger = logging.getLogger(__name__)
+
+
+def _plugin_callback(*, rejected=None, raise_on_pause=False):
+    def decorate(method):
+        @wraps(method)
+        def guarded(self, *args, **kwargs):
+            with self._callback_lock:
+                if self._paused:
+                    if raise_on_pause:
+                        raise RuntimeError("Plugin channel is stopping; retry later")
+                    return rejected
+                self._active_callbacks += 1
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                with self._callback_lock:
+                    self._active_callbacks -= 1
+        return guarded
+    return decorate
 
 
 class PluginChannel(Channel):
@@ -65,9 +86,27 @@ class PluginChannel(Channel):
         self._on_stop_account = on_stop_account
         self._on_validate = on_validate
         self._started: set[str] = set()
+        self._callback_lock = threading.RLock()
+        self._active_callbacks = 0
+        manager = getattr(app, "extension_manager", None)
+        self._paused = bool(getattr(manager, "_transaction_depth", 0))
+
+    def pause_callbacks(self) -> bool:
+        with self._callback_lock:
+            if self._active_callbacks:
+                return False
+            self._paused = True
+            return True
+
+    def resume_callbacks(self) -> bool:
+        with self._callback_lock:
+            was_paused = self._paused
+            self._paused = False
+            return was_paused
 
     # ---- Lifecycle ----
 
+    @_plugin_callback()
     def start_account(self, account: Account) -> None:
         # Only mark the account online if the plugin's start callback succeeds,
         # so a failed start reports offline (is_online=False) and stays eligible
@@ -81,23 +120,40 @@ class PluginChannel(Channel):
                 return
         self._started.add(account.bot_id)
 
+    @_plugin_callback()
     def stop_account(self, account_id: str) -> None:
-        self._started.discard(account_id)
+        self._stop_account(account_id, strict=False)
+
+    def _stop_account(self, account_id: str, *, strict: bool) -> None:
         if self._on_stop_account:
             try:
                 self._on_stop_account(account_id)
             except Exception:
                 logger.exception("插件通道 %s 停止账号失败", self.channel_type)
+                if strict:
+                    raise
+        self._started.discard(account_id)
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, strict: bool = False) -> None:
+        if not self.pause_callbacks():
+            raise RuntimeError("Plugin channel has active callbacks; retry later")
+        errors = []
         for account_id in list(self._started):
-            self.stop_account(account_id)
+            try:
+                # Lifecycle callbacks run after the external callback gate
+                # closes, and must remain available until plugin teardown ends.
+                self._stop_account(account_id, strict=strict)
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError(f"Failed to stop plugin channel: {errors[0]}") from errors[0]
 
     def is_online(self, account_id: str) -> bool:
         return account_id in self._started
 
     # ---- Outbound ----
 
+    @_plugin_callback(rejected=False)
     def deliver_message(
         self,
         persona_id: str,
@@ -124,6 +180,7 @@ class PluginChannel(Channel):
             form["hint"] = self._hint
         return form
 
+    @_plugin_callback(raise_on_pause=True)
     def validate_and_create(self, fields: dict) -> Account:
         if self._on_validate:
             # Plugins raise ValueError with a user-facing message on bad input.

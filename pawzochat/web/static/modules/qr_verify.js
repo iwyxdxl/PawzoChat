@@ -15,7 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-// Shared inline verify-code (pair-code) widget for the WeChat QR login.
+// Shared request and inline verification helpers for WeChat QR login.
 //
 // Some scans trigger a server-side challenge (`need_verifycode`): the user
 // must type the digits shown on their phone. This widget renders an inline
@@ -23,6 +23,35 @@
 // asks for it — so the normal scan→confirm flow is visually unchanged. The
 // typed code is handed back via `onSubmit` and the caller threads it into the
 // next status poll. Used by both quick_setup.js and settings.js.
+
+/** One uncached, cancellable status request within the current login deadline. */
+export async function fetchQrStatus(qrcode, baseUrl, verifyCode, deadline) {
+  const timeout = {status: "local_timeout"};
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return timeout;
+
+  let url = `/api/accounts/qr/status?qrcode=${encodeURIComponent(qrcode)}`;
+  if (baseUrl) url += `&base_url=${encodeURIComponent(baseUrl)}`;
+  if (verifyCode) url += `&verify_code=${encodeURIComponent(verifyCode)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), remaining);
+  try {
+    // QR codes and verification codes must not enter the general GET cache.
+    const response = await fetch((window.PAWZOCHAT_BASE || "") + url, {
+      signal: controller.signal, cache: "no-store",
+    });
+    const data = await response.json().catch(() => null);
+    if (controller.signal.aborted || Date.now() >= deadline) return timeout;
+    if (data && typeof data.status === "string") return data;
+    return {
+      status: response.ok ? "error" : "wait", retryable: !response.ok,
+      errmsg: response.ok ? "收到无法识别的响应，请重新开始" : "连接暂时中断，正在重试…",
+    };
+  } catch (_) {
+    if (controller.signal.aborted || Date.now() >= deadline) return timeout;
+    return {status: "wait", retryable: true, errmsg: "连接暂时中断，正在重试…"};
+  } finally { clearTimeout(timer); }
+}
 
 const BLOCK_CLASS = "qr-verify-block";
 

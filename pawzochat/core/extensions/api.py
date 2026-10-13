@@ -105,6 +105,7 @@ class PluginManifest:
     permissions: list[str] = field(default_factory=list)
     config_schema: dict = field(default_factory=dict)
     config_ui: dict = field(default_factory=dict)
+    platforms: tuple[str, ...] = ()
 
 
 class Plugin(ABC):

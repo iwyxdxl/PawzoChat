@@ -15,11 +15,13 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+import { setPromptValue } from "./prompt_textarea.js";
 import { api } from "./api.js";
 import { showLoading, hideLoading } from "./ui.js";
 import { avatarHtml, esc, iconHtml, CAP_ICONS, ILLEGAL_NAME_RE, escAttr, jsArg, voiceOptionsHtml } from "./utils.js";
 import { openCropModal } from "./contacts.js";
-import { renderVerifyInput, clearVerifyInput } from "./qr_verify.js";
+import { switchTab } from "./navigation.js";
+import { fetchQrStatus, renderVerifyInput, clearVerifyInput } from "./qr_verify.js";
 
 const SCREEN_ID = "quick-setup-screen";
 const STEP_LABELS = ["配置服务商", "新建角色", "绑定账号"];
@@ -97,7 +99,8 @@ async function _finishWizard() {
   el.classList.add("qs-fade-out");
   el.addEventListener("animationend", () => {
     el.remove();
-    try { window.PawzoChat?.switchTab?.("chat"); } catch (_) { /* ignore */ }
+    api.invalidate(/^\/api\/(conversations|personas)(?:\/|\?|$)/);
+    switchTab("chat", { refresh: true });
   }, { once: true });
 }
 
@@ -345,7 +348,7 @@ function _voiceToggleHtml(idSuffix) {
     voiceDropdownHtml = `
     <div class="qs-field" style="margin-top:12px">
       <label class="qs-field-label" for="${voiceId}">音色 (voice ID)</label>
-      <input id="${voiceId}" list="${listId}" value="" placeholder="请选择音色或输入音色 ID" spellcheck="false" autocomplete="off" style="flex:1;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1);text-align:left;width:100%;box-sizing:border-box">
+      <input class="form-input" id="${voiceId}" list="${listId}" value="" placeholder="请选择音色或输入音色 ID" spellcheck="false" autocomplete="off" style="flex:1;text-align:left">
       <datalist id="${listId}">${voiceOptionsHtml(_pawapiVoiceCatalog)}</datalist>
       <div class="qs-hint qs-img-hint"><span>音色 ID 可自由输入；预设列表随所选模型的音色体系变化。可稍后在角色编辑页面调整。</span></div>
     </div>`;
@@ -443,15 +446,15 @@ function _step2Html() {
 
     <div class="qs-field">
       <label class="qs-field-label">人设设定</label>
-      <textarea id="qs-character" class="qs-field-textarea" placeholder="描述角色的背景、性格、经历…" rows="6"></textarea>
+      <textarea id="qs-character" class="prompt-input" placeholder="描述角色的背景、性格、经历…" rows="6"></textarea>
     </div>
     <div class="qs-field">
       <label class="qs-field-label">输出示例</label>
-      <textarea id="qs-examples" class="qs-field-textarea" placeholder="输入角色的经典台词作为风格参考…" rows="2"></textarea>
+      <textarea id="qs-examples" class="prompt-input" placeholder="输入角色的经典台词作为风格参考…" rows="2"></textarea>
     </div>
     <div class="qs-field">
       <label class="qs-field-label">系统提示词</label>
-      <textarea id="qs-system" class="qs-field-textarea" rows="3">${esc(_defaultSysInstr)}</textarea>
+      <textarea id="qs-system" class="prompt-input" rows="3">${esc(_defaultSysInstr)}</textarea>
     </div>
     ${_imgToggleHtml("")}
     ${_voiceToggleHtml("")}
@@ -683,7 +686,7 @@ export function qsToggleCollapse(headerEl) {
 }
 
 export function finishQuickSetup() {
-  _finishWizard();
+  return _finishWizard();
 }
 
 export function qsToggleStep4Telemetry() {
@@ -888,38 +891,44 @@ async function _startQrScan() {
   }
 }
 
-async function _pollQr(qrcode, session) {
+async function _pollQr(qrcode, session, deadline = Date.now() + 5 * 60 * 1000) {
   if (!_qrPolling || session !== _qrSession) return;
   const statusEl = document.getElementById("qs-qr-status");
   if (!statusEl) { _qrPolling = false; return; }
 
+  const finish = (message) => {
+    _qrPolling = false;
+    _qrVerifyCode = "";
+    _qrPollBaseUrl = "";
+    clearVerifyInput(statusEl);
+    statusEl.textContent = message;
+  };
+
   try {
-    let url = `/api/accounts/qr/status?qrcode=${qrcode}`;
-    if (_qrPollBaseUrl) url += `&base_url=${encodeURIComponent(_qrPollBaseUrl)}`;
-    if (_qrVerifyCode) {
-      // Consume the code: one submission = one server-side attempt, so a wrong
-      // code isn't re-sent every 2s (which would burn through the retry limit).
-      url += `&verify_code=${encodeURIComponent(_qrVerifyCode)}`;
-      _qrVerifyCode = "";
-    }
-    const res = await api.get(url, { bypassCache: true });
+    // One submission consumes the code even when the request fails.
+    const verifyCode = _qrVerifyCode;
+    _qrVerifyCode = "";
+    const res = await fetchQrStatus(qrcode, _qrPollBaseUrl, verifyCode, deadline);
     if (!_qrPolling || session !== _qrSession || document.getElementById("qs-qr-status") !== statusEl) return;
+    if (res.status === "local_timeout") {
+      finish("等待已超时，请重新开始连接");
+      return;
+    }
+    if (res.status === "error" || res.retryable === false) {
+      finish(res.errmsg || res.error || "连接未完成，请重新开始");
+      return;
+    }
+    if (res.retryable && res.error_kind !== "timeout") {
+      statusEl.textContent = res.errmsg || "连接暂时中断，正在重试…";
+    }
     if (res.status === "binded_redirect") {
-      _qrPolling = false;
-      _qrPollBaseUrl = "";
-      _qrVerifyCode = "";
-      clearVerifyInput(statusEl);
-      statusEl.textContent = "该微信已连接，请选择已有账号";
+      finish("该微信已连接，请选择已有账号");
       _qsToast("微信已连接，未更改角色绑定", "success");
       setTimeout(() => { if (session === _qrSession) _refreshStep3(); }, 800);
       return;
     }
     if (res.status === "confirmed") {
-      _qrPolling = false;
-      _qrPollBaseUrl = "";
-      _qrVerifyCode = "";
-      clearVerifyInput(statusEl);
-      statusEl.textContent = "登录成功！";
+      finish("登录成功！");
       const botId = res.bot_id || "";
       if (botId && _newPersonaId) {
         try {
@@ -935,10 +944,10 @@ async function _pollQr(qrcode, session) {
       }
       // _refreshStep3 resets the channel selection to the neutral placeholder,
       // so the refreshed step won't auto-rescan.
-      setTimeout(() => _refreshStep3(), 800);
+      setTimeout(() => { if (session === _qrSession) _refreshStep3(); }, 800);
       return;
     }
-    if (res.status === "scaned" || res.status === "scanned") {
+    if (res.status === "scaned") {
       statusEl.textContent = "扫描成功，请在手机上确认";
     } else if (res.status === "scaned_but_redirect") {
       statusEl.textContent = "扫描成功，正在切换线路…";
@@ -948,21 +957,14 @@ async function _pollQr(qrcode, session) {
       statusEl.textContent = "请输入手机上显示的验证码";
       renderVerifyInput(statusEl, (code) => { _qrVerifyCode = code; });
     } else if (res.status === "verify_code_blocked") {
-      _qrVerifyCode = "";
-      clearVerifyInput(statusEl);
-      statusEl.textContent = "验证码错误次数过多，请重新扫码";
-      _qrPolling = false;
-      _qrPollBaseUrl = "";
+      finish("验证码错误次数过多，请重新开始");
       return;
     } else if (res.status === "expired") {
-      clearVerifyInput(statusEl);
-      statusEl.textContent = "二维码已过期，请重新开始";
-      _qrPolling = false;
-      _qrPollBaseUrl = "";
+      finish("二维码已过期，请重新开始");
       return;
     }
   } catch (_) { /* silent */ }
-  setTimeout(() => _pollQr(qrcode, session), 2000);
+  setTimeout(() => _pollQr(qrcode, session, deadline), 2000);
 }
 
 async function _refreshStep3() {
@@ -1425,9 +1427,9 @@ export async function qsGeneratePersona() {
     if (_currentStep !== 2) return;
     if (r.status === 200 && r.data && r.data.ok) {
       const charEl = document.getElementById("qs-character");
-      if (charEl) charEl.value = r.data.character_prompt || "";
+      setPromptValue(charEl, r.data.character_prompt || "");
       const exEl = document.getElementById("qs-examples");
-      if (exEl) exEl.value = r.data.output_examples || "";
+      setPromptValue(exEl, r.data.output_examples || "");
       const nameEl = document.getElementById("qs-persona-name");
       const genName = (r.data.name || "").trim();
       if (nameEl && genName && !nameEl.value.trim()) nameEl.value = genName;

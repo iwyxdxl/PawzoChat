@@ -73,14 +73,12 @@ def _aes_ecb_decrypt(ciphertext: bytes, key: bytes) -> bytes:
 
 
 def _strip_pkcs7_padding(padded: bytes) -> bytes:
-    """Best-effort PKCS7 unpadding."""
-    if not padded:
-        return padded
+    """Reject corrupt data instead of passing invalid plaintext to callers."""
+    if not padded or len(padded) % 16:
+        raise ValueError("invalid PKCS7 padded length")
     pad_len = padded[-1]
-    if pad_len < 1 or pad_len > 16:
-        return padded
-    if padded[-pad_len:] != bytes([pad_len]) * pad_len:
-        return padded
+    if pad_len < 1 or pad_len > 16 or padded[-pad_len:] != bytes([pad_len]) * pad_len:
+        raise ValueError("invalid PKCS7 padding")
     return padded[:-pad_len]
 
 
@@ -244,11 +242,9 @@ def _cdn_post_with_retry(cdn_url: str, data: bytes, label: str, *, guard=None) -
                 timeout=30,
             )
             if 400 <= r.status_code < 500:
-                err_msg = r.headers.get("x-error-message", r.text[:200])
-                raise RuntimeError(f"CDN client error {r.status_code}: {err_msg}")
+                r.raise_for_status()
             if r.status_code != 200:
-                err_msg = r.headers.get("x-error-message", f"status {r.status_code}")
-                raise RuntimeError(f"CDN server error: {err_msg}")
+                raise RuntimeError(f"CDN server error: status {r.status_code}")
 
             download_param = r.headers.get("x-encrypted-param", "")
             if not download_param:
@@ -257,14 +253,17 @@ def _cdn_post_with_retry(cdn_url: str, data: bytes, label: str, *, guard=None) -
             logger.debug("CDN upload success: %s attempt=%d", label, attempt)
             return download_param
 
-        except Exception as e:
+        except requests.HTTPError:
+            # Only the explicit 4xx branch above raises HTTPError.
+            raise
+        except (requests.RequestException, RuntimeError) as e:
             last_error = e
-            if isinstance(e, RuntimeError) and "client error" in str(e):
-                raise
+            # Network exceptions may contain the signed upload URL.
+            detail = type(e).__name__ if isinstance(e, requests.RequestException) else str(e)
             if attempt < UPLOAD_MAX_RETRIES:
-                logger.warning("CDN upload attempt %d failed: %s", attempt, e)
+                logger.warning("CDN upload attempt %d failed: %s", attempt, detail)
             else:
-                logger.error("CDN upload all %d attempts failed: %s", UPLOAD_MAX_RETRIES, e)
+                logger.error("CDN upload all %d attempts failed: %s", UPLOAD_MAX_RETRIES, detail)
 
     raise last_error or RuntimeError("CDN upload failed")
 
@@ -485,10 +484,9 @@ def _aes_ecb_decrypt_file(
         if pending:
             raise ValueError("ciphertext size is not a multiple of 16 bytes")
 
-        if tail:
-            final = _strip_pkcs7_padding(tail)
-            dst.write(final)
-            written += len(final)
+        final = _strip_pkcs7_padding(tail)
+        dst.write(final)
+        written += len(final)
 
     return written
 

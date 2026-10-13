@@ -16,33 +16,37 @@
 
 """Unified HTTP client for the iLink Bot API.
 
-This file contains code ported from ``@tencent-weixin/openclaw-weixin@2.4.6``
+This file contains code ported from ``@tencent-weixin/openclaw-weixin@2.4.9``
 (MIT-licensed).
 See https://github.com/Tencent/openclaw-weixin for the original.
 
 Endpoints: getupdates, sendmessage, getuploadurl, getconfig, sendtyping,
 msg/notifystart, msg/notifystop.
-Plus two GET endpoints for QR-code login.
+QR-code login uses POST start and GET status.
 """
 
 from __future__ import annotations
 
 import base64
 import logging
-import random
 import secrets
 import time
 
 import requests
 import httpx
 
+from pawzochat.transport.diagnostics import qr_request
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
 CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
-CHANNEL_VERSION = "2.4.6"
+CHANNEL_VERSION = "2.4.9"
 ILINK_APP_ID = "bot"
-ILINK_APP_CLIENT_VERSION = 132102  # 2.4.6 encoded as (major<<16 | minor<<8 | patch)
+ILINK_APP_CLIENT_VERSION = sum(
+    (int(part) & 0xff) << shift
+    for part, shift in zip(CHANNEL_VERSION.split("."), (16, 8, 0))
+)
 
 # Self-declared client identity sent in base_info.bot_agent. Mirrors the
 # official plugin's default (config key channels.openclaw-weixin.botAgent),
@@ -57,7 +61,7 @@ DEFAULT_CONFIG_TIMEOUT = 10
 
 def _random_wechat_uin() -> str:
     """Generate X-WECHAT-UIN header: random uint32 → decimal string → base64."""
-    uint32 = random.getrandbits(32)
+    uint32 = secrets.randbits(32)
     return base64.b64encode(str(uint32).encode("utf-8")).decode("ascii")
 
 
@@ -67,6 +71,18 @@ def _build_common_headers() -> dict[str, str]:
         "iLink-App-Id": ILINK_APP_ID,
         "iLink-App-ClientVersion": str(ILINK_APP_CLIENT_VERSION),
     }
+
+
+def _build_post_headers(token: str = "") -> dict[str, str]:
+    headers = {
+        "Content-Type": "application/json",
+        "AuthorizationType": "ilink_bot_token",
+        "X-WECHAT-UIN": _random_wechat_uin(),
+        **_build_common_headers(),
+    }
+    if token.strip():
+        headers["Authorization"] = f"Bearer {token.strip()}"
+    return headers
 
 
 def _build_base_info() -> dict:
@@ -91,17 +107,9 @@ class ILinkClient:
         self._session = requests.Session()
 
     def _headers(self) -> dict[str, str]:
-        headers = {
-            "Content-Type": "application/json",
-            "AuthorizationType": "ilink_bot_token",
-            "X-WECHAT-UIN": _random_wechat_uin(),
-            **_build_common_headers(),
-        }
-        if self.bot_token:
-            headers["Authorization"] = f"Bearer {self.bot_token}"
-        return headers
+        return _build_post_headers(self.bot_token)
 
-    def _post(self, endpoint: str, payload: dict, timeout: int = DEFAULT_API_TIMEOUT, *, lifecycle=False) -> dict:
+    def _post(self, endpoint: str, payload: dict, timeout: float = DEFAULT_API_TIMEOUT, *, lifecycle=False) -> dict:
         if self.connection and not lifecycle:
             self.connection.check()
         url = f"{self.base_url}/{endpoint}"
@@ -124,7 +132,7 @@ class ILinkClient:
             resp = await http.post(
                 f"{self.base_url}/ilink/bot/getupdates",
                 json={"get_updates_buf": buf, "base_info": _build_base_info()},
-                headers=self._headers(), timeout=(timeout or DEFAULT_LONG_POLL_TIMEOUT) + 5,
+                headers=self._headers(), timeout=timeout if timeout is not None else DEFAULT_LONG_POLL_TIMEOUT,
             )
             resp.raise_for_status()
             return resp.json() if resp.content else {}
@@ -133,14 +141,14 @@ class ILinkClient:
 
     # ---- Core API endpoints ----
 
-    def get_updates(self, buf: str = "", timeout: int | None = None) -> dict:
+    def get_updates(self, buf: str = "", timeout: float | None = None) -> dict:
         """Long-poll for new messages. Returns raw response dict."""
-        poll_timeout = timeout or DEFAULT_LONG_POLL_TIMEOUT
+        poll_timeout = timeout if timeout is not None else DEFAULT_LONG_POLL_TIMEOUT
         try:
             return self._post(
                 "ilink/bot/getupdates",
                 {"get_updates_buf": buf},
-                timeout=poll_timeout + 5,
+                timeout=poll_timeout,
             )
         except requests.Timeout:
             logger.debug("getUpdates: 长轮询超时，正常重试")
@@ -216,9 +224,11 @@ class ILinkClient:
         account startup. Mirrors upstream gateway.startAccount -> notifyStart.
         """
         try:
-            self._post("ilink/bot/msg/notifystart", {}, timeout=DEFAULT_CONFIG_TIMEOUT, lifecycle=True)
+            result = self._post("ilink/bot/msg/notifystart", {}, timeout=DEFAULT_CONFIG_TIMEOUT, lifecycle=True)
+            if result.get("ret") not in (None, 0, "0"):
+                logger.warning("notifystart 返回非零业务码（已忽略）")
         except Exception:
-            logger.warning("notifystart 失败（已忽略）", exc_info=True)
+            logger.warning("notifystart 失败（已忽略）")
 
     def notify_stop(self) -> None:
         """Tell the server this account's client is going offline.
@@ -227,9 +237,11 @@ class ILinkClient:
         shutdown / account removal. Mirrors upstream gateway.stopAccount -> notifyStop.
         """
         try:
-            self._post("ilink/bot/msg/notifystop", {}, timeout=DEFAULT_CONFIG_TIMEOUT, lifecycle=True)
+            result = self._post("ilink/bot/msg/notifystop", {}, timeout=DEFAULT_CONFIG_TIMEOUT, lifecycle=True)
+            if result.get("ret") not in (None, 0, "0"):
+                logger.warning("notifystop 返回非零业务码（已忽略）")
         except Exception:
-            logger.warning("notifystop 失败（已忽略）", exc_info=True)
+            logger.warning("notifystop 失败（已忽略）")
 
     # ---- QR Code login (POST start / GET status, no auth needed) ----
 
@@ -241,35 +253,24 @@ class ILinkClient:
         the request is no longer aborted on a fixed deadline. Server / TCP
         stack limits still apply.
         """
-        url = f"{base_url.rstrip('/')}/ilink/bot/get_bot_qrcode"
-        headers = _build_common_headers()
-        tokens = list(dict.fromkeys(t for t in local_tokens if isinstance(t, str) and t))[:10]
-        resp = requests.post(url, params={"bot_type": 3}, json={"local_token_list": tokens},
-                             headers=headers, timeout=None)
-        if resp.status_code in (404, 405):
-            resp = requests.get(url, params={"bot_type": 3}, headers=headers, timeout=None)
-        resp.raise_for_status()
-        return resp.json()
+        tokens = list(dict.fromkeys(t.strip() for t in local_tokens
+                                    if isinstance(t, str) and t.strip()))[:10]
+        return qr_request(
+            "get_bot_qrcode", base_url, headers=_build_post_headers(),
+            tokens=tokens,
+        )
 
     @staticmethod
     def check_qrcode_status(
         qrcode: str,
         base_url: str = DEFAULT_BASE_URL,
-    ) -> dict | None:
-        """Long-poll QR code scan status.
-
-        Returns {"status": "wait"|"scaned"|"scaned_but_redirect"|"confirmed"|"expired", ...},
-        or None on timeout (caller should just retry).
-        """
-        url = f"{base_url.rstrip('/')}/ilink/bot/get_qrcode_status"
-        headers = _build_common_headers()
-        try:
-            resp = requests.get(url, params={"qrcode": qrcode}, headers=headers, timeout=35)
-            resp.raise_for_status()
-            return resp.json()
-        except (requests.Timeout, requests.ConnectionError):
-            logger.debug("check_qrcode_status: 长轮询超时，正常重试")
-            return None
+        verify_code: str = "",
+    ) -> dict:
+        """Poll for 35 seconds; return a safe, classified error on failure."""
+        return qr_request(
+            "get_qrcode_status", base_url, headers=_build_common_headers(),
+            qrcode=qrcode, verify_code=verify_code,
+        )
 
     # ---- Helper: build a sendMessage text payload ----
 
@@ -281,6 +282,7 @@ class ILinkClient:
     ) -> dict:
         """Construct a WeixinMessage dict for sending a text message."""
         return {
+            "from_user_id": "",
             "to_user_id": to_user_id,
             "client_id": _generate_client_id(),
             "message_type": 2,  # BOT
@@ -308,6 +310,7 @@ class ILinkClient:
           - mid_size: ciphertext file size in bytes
         """
         return {
+            "from_user_id": "",
             "to_user_id": to_user_id,
             "client_id": _generate_client_id(),
             "message_type": 2,  # BOT
@@ -351,6 +354,7 @@ class ILinkClient:
         """
         resolved_name = (file_name or cdn_info["file_name"]).strip() or cdn_info["file_name"]
         return {
+            "from_user_id": "",
             "to_user_id": to_user_id,
             "client_id": _generate_client_id(),
             "message_type": 2,  # BOT

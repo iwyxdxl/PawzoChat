@@ -4,11 +4,13 @@ import { VirtualMessages } from './virtual_messages.js';
 
 /* Owns one mounted chat session. Read requests never use the shared SWR cache. */
 export class ChatHistory {
-  constructor({ el, personaId, renderItem, onUnread, onError, onDistanceChange }) {
+  constructor({ el, personaId, messagesUrl, renderItem, onUnread, onError, onDistanceChange, onState }) {
     this.personaId = personaId;
+    this.messagesUrl = messagesUrl || `/api/conversations/${encodeURIComponent(personaId)}/messages`;
     this.onUnread = onUnread;
     this.onError = onError;
     this.onDistanceChange = onDistanceChange;
+    this.onState = onState;
     this.timeline = new ChatTimeline();
     this.unread = new Set();
     this.generation = 0;
@@ -19,7 +21,7 @@ export class ChatHistory {
 
   async request(params, signal = this.controller.signal) {
     const query = new URLSearchParams({ limit: '60', ...params });
-    const response = await fetch(`${window.PAWZOCHAT_BASE || ''}/api/conversations/${encodeURIComponent(this.personaId)}/messages?${query}`, { signal, cache: 'no-store' });
+    const response = await fetch(`${window.PAWZOCHAT_BASE || ''}${this.messagesUrl}?${query}`, { signal, cache: 'no-store' });
     const result = await response.json();
     if (!response.ok) throw Object.assign(new Error(result.error || '加载失败'), { status: response.status });
     return result;
@@ -43,6 +45,7 @@ export class ChatHistory {
     try {
       const page = await this.request({});
       if (!this.current(generation)) return;
+      this.onState?.(page.state);
       // Keep outstanding local sends when a structural edit resets paging.
       const persisted = new Set(page.messages.map(m => m.local_id || m._page_key));
       const pending = this.timeline.items.filter(m => (m._pending || m._failed) && !persisted.has(m._key));
@@ -92,6 +95,7 @@ export class ChatHistory {
     try {
       const page = await task;
       if (!this.current(generation)) return;
+      this.onState?.(page.state);
       this.before = page.before_cursor;
       this.hasMore = page.has_more;
       this.timeline.merge(page.messages);
@@ -142,6 +146,7 @@ export class ChatHistory {
           do {
             const page = await this.request({ after: this.after });
             if (!this.current(generation)) return;
+            this.onState?.(page.state);
             this.after = page.after_cursor;
             if (page.messages.length) this.apply(page.messages, true);
             more = page.has_more;

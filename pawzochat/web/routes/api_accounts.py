@@ -23,11 +23,11 @@ import io
 import logging
 from datetime import datetime, timezone
 
-import requests as http_requests
 from flask import Blueprint, jsonify, request
 
-from pawzochat.transport.client import DEFAULT_BASE_URL, ILinkClient, _build_common_headers
+from pawzochat.transport.client import DEFAULT_BASE_URL, ILinkClient
 from pawzochat.transport.models import Account
+from pawzochat.transport.diagnostics import qr_error
 from pawzochat.web.routes import get_app
 
 logger = logging.getLogger(__name__)
@@ -125,12 +125,12 @@ def qr_start():
         qrcode_str = qr_data.get("qrcode", "")
         qr_img_content = qr_data.get("qrcode_img_content", "")
         if not qrcode_str:
-            return jsonify({"error": "Failed to get QR code"}), 500
+            return jsonify({**qr_data, "error": qr_data.get("errmsg", "获取二维码失败，请稍后重试")}), 502
         qr_image = _generate_qr_base64(qr_img_content or qrcode_str)
         return jsonify({"qr_image": qr_image, "qrcode": qrcode_str})
     except Exception:
-        logger.exception("获取二维码失败")
-        return jsonify({"error": "获取二维码失败，请稍后重试"}), 500
+        logger.warning("获取二维码失败")
+        return jsonify({**qr_error("invalid_response"), "error": "获取二维码失败，请稍后重试"}), 502
 
 
 @api_accounts_bp.route("/qr/status", methods=["GET"])
@@ -140,9 +140,11 @@ def qr_status():
     verify_code = request.args.get("verify_code", "")
     app = get_app()
 
-    status_data = _check_qr_status_short(qrcode, base_url, verify_code)
-    if status_data is None:
-        return jsonify({"status": "wait"})
+    if not qrcode:
+        return jsonify(qr_error("invalid_response")), 400
+    status_data = ILinkClient.check_qrcode_status(qrcode, base_url, verify_code)
+    if status_data.get("error_kind"):
+        return jsonify(status_data)
 
     status = status_data.get("status", "")
 
@@ -161,7 +163,7 @@ def qr_status():
             bot_id = str(status_data.get("ilink_bot_id", "") or "").strip()
             if not bot_id:
                 logger.error("扫码已确认，但响应缺少 ilink_bot_id")
-                return jsonify({"error": "登录失败：服务器未返回账号 ID"}), 502
+                return jsonify({**qr_error("invalid_response"), "error": "登录失败：服务器未返回账号 ID"}), 502
             confirmed_token = str(status_data.get("bot_token", "") or "")
             confirmed_user_id = str(status_data.get("ilink_user_id", "") or "")
             confirmed_base_url = str(
@@ -170,12 +172,12 @@ def qr_status():
             existing = next((a for a in app.accounts if a.bot_id == bot_id), None)
             if existing:
                 if existing.channel_type != "wechat":
-                    return jsonify({"error": "该账号 ID 已被其他通道使用"}), 409
+                    return jsonify({**qr_error("invalid_response"), "error": "该账号 ID 已被其他通道使用"}), 409
                 new_token = confirmed_token or existing.bot_token
                 new_user_id = confirmed_user_id or existing.ilink_user_id
                 if not new_token:
                     logger.error("扫码已确认，但账号缺少 bot_token (bot_id=%s)", bot_id)
-                    return jsonify({"error": "登录失败：服务器未返回登录凭据"}), 502
+                    return jsonify({**qr_error("invalid_response"), "error": "登录失败：服务器未返回登录凭据"}), 502
                 new_extra = {**(existing.extra or {}), "base_url": confirmed_base_url}
                 if confirmed_token and confirmed_token != existing.bot_token:
                     new_extra.pop("cooldown_until", None)
@@ -188,12 +190,10 @@ def qr_status():
                 if credentials_changed and channel:
                     channel.stop_account(bot_id)
                 if credentials_changed:
-                    with app._accounts_lock:
-                        existing.bot_token = new_token
-                        existing.ilink_user_id = new_user_id
-                        existing.extra = new_extra
-                        app._auth_manager.update_account(existing)
-                channel = app.channel_registry.get("wechat", default=None)
+                    existing.bot_token = new_token
+                    existing.ilink_user_id = new_user_id
+                    existing.extra = new_extra
+                    app._auth_manager.update_account(existing)
                 if channel and (
                     credentials_changed or not channel.is_online(bot_id)
                 ):
@@ -204,7 +204,7 @@ def qr_status():
 
             if not confirmed_token:
                 logger.error("扫码已确认，但响应缺少 bot_token (bot_id=%s)", bot_id)
-                return jsonify({"error": "登录失败：服务器未返回登录凭据"}), 502
+                return jsonify({**qr_error("invalid_response"), "error": "登录失败：服务器未返回登录凭据"}), 502
             account = Account(
                 bot_id=bot_id,
                 bot_token=confirmed_token,
@@ -249,9 +249,8 @@ def delete_account(bot_id: str):
 
         # Atomic with create/QR-confirm appends so a concurrent op can't resurrect
         # a just-deleted account or drop a just-added one.
-        with app._accounts_lock:
-            app.accounts = [a for a in app.accounts if a.bot_id != bot_id]
-            app._auth_manager.remove_account(bot_id)
+        app.accounts = [a for a in app.accounts if a.bot_id != bot_id]
+        app._auth_manager.remove_account(bot_id)
         app.conversation_store.quotes.purge(account=bot_id)
         if channel and hasattr(channel, "remove_account_state"):
             channel.remove_account_state(bot_id)
@@ -261,28 +260,6 @@ def delete_account(bot_id: str):
 
 
 # ---- Helpers ----
-
-def _check_qr_status_short(
-    qrcode: str, base_url: str, verify_code: str = "",
-) -> dict | None:
-    url = f"{base_url.rstrip('/')}/ilink/bot/get_qrcode_status"
-    headers = _build_common_headers()
-    params = {"qrcode": qrcode}
-    if verify_code:
-        params["verify_code"] = verify_code
-    try:
-        resp = http_requests.get(
-            url, params=params, headers=headers, timeout=8
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except (http_requests.RequestException, ValueError):
-        # Timeout / connection error / non-2xx / malformed-JSON body: treat as
-        # a transient "no status yet" so the poller keeps waiting instead of
-        # bubbling a 500 out of qr_status.
-        return None
-    return data if isinstance(data, dict) else None
-
 
 def _generate_qr_base64(content: str) -> str:
     import qrcode

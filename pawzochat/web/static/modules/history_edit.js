@@ -20,9 +20,21 @@ import { api } from "./api.js";
 import { renderQuoteBox } from "./quote.js";
 import { $, content } from "./state.js";
 import { toast, confirm, showLoading, hideLoading } from "./ui.js";
-import { setTopBar, registerPageRenderer } from "./navigation.js";
+import { setTopBar, registerPageRenderer, setPageCleanup } from "./navigation.js";
 
 let _personaId = null;
+let _groupId = null;
+let _historyGeneration = 0;
+
+function messagesUrl() {
+  return _groupId ? `/api/groups/${encodeURIComponent(_groupId)}/messages` : `/api/conversations/${encodeURIComponent(_personaId)}/messages`;
+}
+
+function historyMediaUrl(kind, filename) {
+  const base = window.PAWZOCHAT_BASE || "";
+  return _groupId ? `${base}/api/groups/${encodeURIComponent(_groupId)}/media/${kind}/${encodeURIComponent(filename)}`
+    : `${base}/api/${kind === 'voice' ? 'audio' : kind}/${encodeURIComponent(_personaId)}/${encodeURIComponent(filename)}`;
+}
 let _messages = [];
 let _dates = [];
 let _currentDate = "";
@@ -46,7 +58,7 @@ function _setTopBarForMode() {
     setTopBar(
       "编辑历史消息",
       true,
-      `<button class="btn-text" onclick="PawzoChat.heEnterSelectMode()" style="font-size:15px;font-weight:500">多选</button>`
+      `<button class="btn-text" onclick="PawzoChat.heEnterSelectMode()">多选</button>`
     );
     return;
   }
@@ -56,8 +68,8 @@ function _setTopBarForMode() {
   setTopBar(
     `已选 ${n} 项`,
     false,
-    `<button class="btn-text danger"${onClickAttr}${disabled} style="font-size:15px;font-weight:500">删除所选</button>`,
-    `<button class="btn-text" onclick="PawzoChat.heExitSelectMode()" style="font-size:15px;font-weight:500">取消</button>`
+    `<button class="btn-text danger"${onClickAttr}${disabled}>删除所选</button>`,
+    `<button class="btn-text" onclick="PawzoChat.heExitSelectMode()">取消</button>`
   );
 }
 
@@ -86,7 +98,7 @@ function _renderContent(blocks) {
         src = /^https?:\/\//i.test(b.url) ? b.url : base + b.url;
       } else if (b.path) {
         const filename = b.path.split(/[\\/]/).pop();
-        src = base + "/api/images/" + _personaId + "/" + filename;
+        src = historyMediaUrl("images", filename);
       }
       if (src) {
         parts += `<div class="he-media"><img src="${esc(src)}" alt="image" loading="lazy" onclick="PawzoChat.openImagePreview(this.src)"></div>`;
@@ -94,7 +106,7 @@ function _renderContent(blocks) {
     } else if (b.type === "file") {
       const diskName = (b.path || "").split(/[\\/]/).pop() || "";
       const displayName = b.name || diskName || "文件";
-      const href = diskName ? base + "/api/files/" + _personaId + "/" + diskName : "#";
+      const href = diskName ? historyMediaUrl("files", diskName) : "#";
       parts += `<a class="msg-file" href="${esc(href)}" download="${esc(displayName)}" title="${esc(displayName)}">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
         <span class="msg-file-name">${esc(displayName)}</span>
@@ -102,7 +114,7 @@ function _renderContent(blocks) {
       </a>`;
     } else if (b.type === "voice") {
       const fname = (b.path || "").split(/[\\/]/).pop() || "";
-      const src = fname ? base + "/api/audio/" + _personaId + "/" + fname : "";
+      const src = fname ? historyMediaUrl("voice", fname) : "";
       if (src) {
         const secs = Math.max(1, Math.round((b.duration_ms || 0) / 1000));
         parts += `<div class="msg-voice" data-src="${escAttr(src)}" title="${escAttr(b.text || "")}" onclick="PawzoChat.playVoiceMessage(this)">
@@ -202,7 +214,7 @@ function _renderList() {
   const items = _messages
     .map(m => {
       const gi = m.index;
-      const roleLabel = m.role === "user" ? "用户" : "助手";
+      const roleLabel = m.role === "user" ? "用户" : _groupId ? m.speaker_name || m.speaker_id || "已移除角色" : "助手";
       const roleCls = m.role === "user" ? "he-role-user" : "he-role-assistant";
       const canEdit = _hasText(m.content);
       const isSelected = _selectMode && _selected.has(gi);
@@ -223,7 +235,7 @@ function _renderList() {
       return `<div class="${itemCls}" id="he-item-${gi}"${itemOnclick}>
       <div class="he-header">
         ${cb}
-        <span class="he-role ${roleCls}">${roleLabel}</span>
+        <span class="he-role ${roleCls}">${esc(roleLabel)}</span>
         <span class="he-time">${formatMsgTime(m.timestamp)}</span>
         <span class="he-source">${esc(m.source || "")}</span>
         <span class="he-actions">
@@ -231,7 +243,7 @@ function _renderList() {
           <button class="he-btn he-btn-del" ${delAttrs}>${iconHtml("ri-delete-bin-line")}</button>
         </span>
       </div>
-      <div class="he-body">${_renderContent(m.content)}${renderQuoteBox(m.quote, m.quote_media || [], m.local_id, _personaId)}</div>
+      <div class="he-body">${_renderContent(m.content)}${renderQuoteBox(m.quote, m.quote_media || [], m.local_id, _personaId, _groupId)}</div>
     </div>`;
     })
     .join("");
@@ -258,20 +270,27 @@ function _scrollPage(toBottom) {
 }
 
 async function _loadDates() {
-  const res = await api.get(`/api/conversations/${_personaId}/messages/dates`);
+  const generation = _historyGeneration;
+  const res = await api.get(`${messagesUrl()}/dates`, { bypassCache: true });
+  if (generation !== _historyGeneration) return;
   _dates = res.dates || [];
   _latestDate = _dates.length > 0 ? _dates[0].date : "";
 }
 
 async function _loadDateMessages(dateStr) {
   _currentDate = dateStr;
-  const res = await api.get(`/api/conversations/${_personaId}/messages?date=${dateStr}`);
-  _messages = res.messages || [];
+  const generation = _historyGeneration;
+  const res = await api.get(`${messagesUrl()}?date=${encodeURIComponent(dateStr)}`, { bypassCache: true });
+  if (generation !== _historyGeneration || dateStr !== _currentDate) return false;
+  _messages = (res.messages || []).map((message, index) => ({ ...message, index: message.index ?? message._position ?? index }));
+  return true;
 }
 
 async function _refreshHistoryView({ reloadDates = false, scrollToBottom = false } = {}) {
+  const generation = _historyGeneration;
   if (reloadDates) {
     await _loadDates();
+    if (generation !== _historyGeneration) return false;
     if (_dates.length === 0) {
       _renderEmptyPage();
       return false;
@@ -282,7 +301,7 @@ async function _refreshHistoryView({ reloadDates = false, scrollToBottom = false
     _renderDateBar();
   }
 
-  await _loadDateMessages(_currentDate);
+  if (!await _loadDateMessages(_currentDate) || generation !== _historyGeneration) return false;
   _renderList();
   _updateDateCount();
   if (scrollToBottom) _scrollPage(true);
@@ -290,7 +309,10 @@ async function _refreshHistoryView({ reloadDates = false, scrollToBottom = false
 }
 
 async function renderHistoryEdit(data) {
+  const generation = ++_historyGeneration;
+  setPageCleanup(() => { ++_historyGeneration; });
   _personaId = data.personaId;
+  _groupId = data.groupId || null;
   _selectMode = false;
   _selected.clear();
   _setTopBarForMode();
@@ -302,10 +324,11 @@ async function renderHistoryEdit(data) {
   try {
     await _loadDates();
   } catch (e) {
-    toast("加载失败", "error");
+    if (generation === _historyGeneration) toast("加载失败", "error");
     return;
   }
 
+  if (generation !== _historyGeneration) return;
   if (_dates.length === 0) {
     _renderEmptyPage();
     return;
@@ -323,12 +346,13 @@ async function renderHistoryEdit(data) {
   try {
     await _refreshHistoryView({ scrollToBottom: true });
   } catch (e) {
-    toast("加载消息失败", "error");
+    if (generation === _historyGeneration) toast("加载消息失败", "error");
     return;
   }
 }
 
 export async function heDateChange(dateStr) {
+  const generation = _historyGeneration;
   const list = $("he-list");
   if (list) list.innerHTML = `<div class="loading-center"><div class="spinner"></div></div>`;
   _currentDate = dateStr;
@@ -336,7 +360,7 @@ export async function heDateChange(dateStr) {
   try {
     await _refreshHistoryView({ scrollToBottom: true });
   } catch (e) {
-    toast("加载消息失败", "error");
+    if (generation === _historyGeneration && dateStr === _currentDate) toast("加载消息失败", "error");
   }
 }
 
@@ -381,6 +405,7 @@ export function heClearQuoteEdit(globalIndex) {
 }
 
 export async function saveHistoryMsg(globalIndex) {
+  const generation = _historyGeneration;
   const ta = document.getElementById(`he-ta-${globalIndex}`);
   if (!ta) return;
   const newText = ta.value;
@@ -396,10 +421,10 @@ export async function saveHistoryMsg(globalIndex) {
 
   showLoading("保存中…");
   try {
-    const res = await api.put(
-      `/api/conversations/${_personaId}/messages/${globalIndex}`,
-      payload
-    );
+    const res = _groupId
+      ? await api.patch(`${messagesUrl()}/${encodeURIComponent(m.local_id)}`, payload)
+      : await api.put(`/api/conversations/${_personaId}/messages/${globalIndex}`, payload);
+    if (generation !== _historyGeneration) return;
     if (res.status === 409 || res.status === 404) {
       toast(res.data?.error || "消息已变化，请刷新后重试", "error");
       await _refreshHistoryView({ reloadDates: true });
@@ -412,7 +437,7 @@ export async function saveHistoryMsg(globalIndex) {
     toast("已保存", "success");
     await _refreshHistoryView();
   } catch (e) {
-    toast("保存失败", "error");
+    if (generation === _historyGeneration) toast("保存失败", "error");
   }
   finally { hideLoading(); }
 }
@@ -423,17 +448,17 @@ export function cancelHistoryEdit() {
 
 export async function deleteHistoryMsg(globalIndex) {
   if (_selectMode) return;
-  const ok = await confirm("删除消息", "确认删除这条消息？此操作不可撤销。", true);
-  if (!ok) return;
-
+  const generation = _historyGeneration;
   const m = _messages.find(msg => msg.index === globalIndex);
   if (!m) return;
+  const url = _groupId ? `${messagesUrl()}/${encodeURIComponent(m.local_id)}?fingerprint=${encodeURIComponent(m.fingerprint || "")}` : `/api/conversations/${_personaId}/messages/${globalIndex}?fingerprint=${encodeURIComponent(m.fingerprint || "")}`;
+  const ok = await confirm("删除消息", "确认删除这条消息？此操作不可撤销。", true);
+  if (!ok || generation !== _historyGeneration) return;
 
   showLoading("删除中…");
   try {
-    const res = await api.del(
-      `/api/conversations/${_personaId}/messages/${globalIndex}?fingerprint=${encodeURIComponent(m.fingerprint || "")}`
-    );
+    const res = await api.del(url);
+    if (generation !== _historyGeneration) return;
     if (res.status === 409 || res.status === 404) {
       toast(res.data?.error || "消息已变化，请刷新后重试", "error");
       await _refreshHistoryView({ reloadDates: true });
@@ -446,7 +471,7 @@ export async function deleteHistoryMsg(globalIndex) {
     toast("已删除", "success");
     await _refreshHistoryView({ reloadDates: true });
   } catch (e) {
-    toast("删除失败", "error");
+    if (generation === _historyGeneration) toast("删除失败", "error");
   }
   finally { hideLoading(); }
 }
@@ -477,6 +502,7 @@ export function heToggleSelectItem(globalIndex) {
     if (!m) return;
     _selected.set(gi, {
       index: gi,
+      local_id: m.local_id,
       fingerprint: m.fingerprint || "",
       date: _currentDate,
     });
@@ -498,6 +524,7 @@ export function heToggleSelectAllCurrentDate() {
     for (const m of _messages) {
       _selected.set(m.index, {
         index: m.index,
+        local_id: m.local_id,
         fingerprint: m.fingerprint || "",
         date: _currentDate,
       });
@@ -519,6 +546,8 @@ function _groupSelectedByDate() {
 
 export async function heBatchDeleteSelected() {
   if (!_selectMode) return;
+  const generation = _historyGeneration;
+  const groupId = _groupId, personaId = _personaId, endpoint = messagesUrl();
   const total = _selected.size;
   if (total === 0) return;
 
@@ -527,7 +556,7 @@ export async function heBatchDeleteSelected() {
   const desc = `将删除以下消息：\n${lines}\n共 ${total} 条。此操作不可撤销。`;
 
   const ok = await confirm("批量删除", desc, true);
-  if (!ok) return;
+  if (!ok || generation !== _historyGeneration) return;
 
   // Sort by index DESC so deleting one does not shift the indices of remaining items.
   const items = [..._selected.values()].sort((a, b) => b.index - a.index);
@@ -537,10 +566,11 @@ export async function heBatchDeleteSelected() {
   let failCount = 0;
   try {
     for (let i = 0; i < items.length; i++) {
+      if (generation !== _historyGeneration) return;
       const it = items[i];
       try {
         const res = await api.del(
-          `/api/conversations/${_personaId}/messages/${it.index}?fingerprint=${encodeURIComponent(it.fingerprint || "")}`
+          groupId ? `${endpoint}/${encodeURIComponent(it.local_id)}?fingerprint=${encodeURIComponent(it.fingerprint || "")}` : `/api/conversations/${personaId}/messages/${it.index}?fingerprint=${encodeURIComponent(it.fingerprint || "")}`
         );
         if (res.status >= 200 && res.status < 300) {
           okCount++;
@@ -556,6 +586,7 @@ export async function heBatchDeleteSelected() {
     hideLoading();
   }
 
+  if (generation !== _historyGeneration) return;
   _selected.clear();
   _selectMode = false;
   _setTopBarForMode();

@@ -26,6 +26,7 @@ from pawzochat.transport.models import (
     MessageItem,
     MessageItemType,
 )
+from pawzochat.utils.text_splitter import strip_voice_markers
 
 _WEEKDAYS = ("一", "二", "三", "四", "五", "六", "日")
 
@@ -43,6 +44,13 @@ _TIME_PREFIX_RE = re.compile(
 )
 
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
+
+# These are group-context metadata, not ordinary bracketed message content.
+_GROUP_SPEAKER_LABEL_RE = re.compile(
+    r"[\[【]群成员[：:][^\[\]【】\r\n]*?[；;][ \t]*"
+    r"角色[ \t]*ID[：:][ \t]*[A-Za-z0-9_-]+[ \t]*[\]】]"
+    r"[ \t]*(?:[：:][ \t]*)?"
+)
 
 
 def format_message_time(timestamp: str | None = None) -> str:
@@ -170,3 +178,39 @@ def clean_assistant_reply_text(text: str) -> str:
     text = _MULTI_NEWLINE_RE.sub("\n\n", text)
 
     return text.strip()
+
+
+def strip_group_speaker_labels(text: str) -> str:
+    """Remove copied group metadata at the start of a reply/bubble/voice run.
+
+    Keep literal labels inside prose, quotations and ordinary bracketed text.
+    A voice marker may precede a leaked label; preserve that marker so the
+    regular voice pipeline still receives it. Call only for group assistants,
+    never for user content or private conversations.
+    """
+    if not text:
+        return ""
+    parts = re.split(r"([\r\n\\$])", text)
+    for index in range(0, len(parts), 2):
+        segment = parts[index]
+        kept: list[str] = []
+        start = 0
+        at_boundary = True
+        for match in _GROUP_SPEAKER_LABEL_RE.finditer(segment):
+            prefix = segment[start:match.start()]
+            if not at_boundary or strip_voice_markers(prefix).strip():
+                # A voice run can start after prose on the same line. Keep
+                # the marker while removing its copied speaker prefix, even
+                # when this round will subsequently ignore voice markers.
+                marker_start = max(prefix.rfind("["), prefix.rfind("【"))
+                if marker_start < 0 or strip_voice_markers(prefix[marker_start:]).strip():
+                    kept.append(segment[start:match.end()])
+                    start = match.end()
+                    at_boundary = False
+                    continue
+            kept.append(prefix)
+            start = match.end()
+            at_boundary = True
+        if start:
+            parts[index] = "".join(kept) + segment[start:]
+    return "".join(parts).strip()

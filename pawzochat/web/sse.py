@@ -23,12 +23,13 @@ import queue
 import threading
 
 MAX_SSE_CLIENTS = 20
+_LOCAL_PLUGIN_EVENTS = frozenset({"plugin_task_progress", "plugin_updates_available"})
 
 _clients: list[queue.Queue] = []
 _clients_lock = threading.Lock()
 
 
-def sse_stream():
+def sse_stream(*, is_public: bool = False):
     """Generator for the SSE endpoint — yields ``data: …\\n\\n`` lines."""
     with _clients_lock:
         if len(_clients) >= MAX_SSE_CLIENTS:
@@ -42,6 +43,8 @@ def sse_stream():
     try:
         while True:
             data = q.get()
+            if is_public and json.loads(data).get("type") in _LOCAL_PLUGIN_EVENTS:
+                continue
             yield f"data: {data}\n\n"
     finally:
         with _clients_lock:

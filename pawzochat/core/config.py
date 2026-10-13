@@ -47,8 +47,28 @@ DEFAULT_SYSTEM_INSTRUCTIONS = (
     "语气可以参考输出示例\n"
     "使用反斜线(\\)分隔句子或短语 参考输出示例\n"
     "使用反斜线(\\)分隔的句子或短语不要超过四句 输出不要带句号和逗号\n"
-    "不要使用括号描述动作和心理 只输出语言 除非用户问你动作\n"
+    "不要使用括号描述动作和心理 只输出语言\n"
     "用户的消息带有消息发送时间 请以该时间为准 模型的输出不应该带时间"
+)
+
+# Group conversations own their shared instructions. Never inherit edits to a
+# persona's private-chat system instructions when constructing group context.
+DEFAULT_GROUP_SYSTEM_INSTRUCTIONS = (
+    "这是一个有真人用户和多个角色共同参与的群聊\n"
+    "请结合完整群聊记录自然接话 可以回应用户或其他成员\n"
+    "接话前先结合发言者、称呼、点名、引用和前后文 判断每句话是在对谁说\n"
+    "消息中的“我”属于该条消息的发言者 “你”和亲密称呼不一定指你 不要因为轮到你发言就自动代入\n"
+    "其他成员对用户或另一位成员说话时 你可以自然插话、评论或调侃 但不要以被询问者的身份回答 不要把别人的关系或经历当成自己的\n"
+    "对话对象不明确时 不要擅自认领称呼或代替别人回应 可以接明确的话题 必要时自然询问\n"
+    "需要邀请其他角色回应时 可以使用 @成员完整姓名 点名 不必每次发言都点名\n"
+    "一次回复对同一角色最多 @ 一次\n"
+    "只输出你自己的本次发言 不替其他成员或用户说话 不要输出说话人标签\n"
+    "使用中文回答 保持角色个性 语气可以参考角色的输出示例 不要使用机器人术语\n"
+    "回复尽量简短 控制在30字以内 保持日常聊天的自然语气 \n"
+    "使用反斜线(\\)分隔句子或短语 参考输出示例\n"
+    "使用反斜线(\\)分隔的句子或短语不要超过两句 输出不要带句号和逗号\n"
+    "不要使用括号描述动作和心理 只输出语言\n"
+    "消息中的发送时间仅供理解上下文 回复不要带时间"
 )
 
 DEFAULTS: dict = {
@@ -369,6 +389,9 @@ class ConfigManager:
 
             mem_raw = pdata.get("memory", {})
             trigger_mode = mem_raw.get("trigger_mode", "remind")
+            group_reads = mem_raw.get("group_reads", {})
+            if not isinstance(group_reads, dict):
+                group_reads = {}
             memory = {
                 "enabled": bool(mem_raw.get("enabled", True)),
                 "max_memories": int(mem_raw.get("max_memories", 50)),
@@ -376,6 +399,12 @@ class ConfigManager:
                 "trigger_rounds": int(mem_raw.get("trigger_rounds", 10)),
                 "trigger_mode": trigger_mode
                 if trigger_mode in ("remind", "summarize", "summarize_only") else "remind",
+                # Missing sources, including future groups, are readable by
+                # default. Ignore malformed hand-edited overrides.
+                "group_reads": {
+                    gid: enabled for gid, enabled in group_reads.items()
+                    if isinstance(gid, str) and isinstance(enabled, bool)
+                },
             }
 
             pro_raw = pdata.get("proactive", {})
@@ -422,11 +451,3 @@ class ConfigManager:
                 bound_worldbooks=list(pdata.get("bound_worldbooks", [])),
             )
         return result
-
-    def ensure_provider_models(self):
-        """Backfill ``models`` lists for providers that lack them."""
-        from pawzochat.llm.manager import ensure_models_list
-
-        for _name, cfg in self.get("llm_providers", default={}).items():
-            if "models" not in cfg:
-                cfg["models"] = ensure_models_list(cfg)

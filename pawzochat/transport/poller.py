@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import httpx
 import time
+import math
 import logging
 import threading
 from typing import TYPE_CHECKING, Callable
@@ -48,7 +49,7 @@ class MessagePoller:
         client: ILinkClient,
         auth_manager: AuthManager,
         on_message: Callable[[str, object], None],
-        poll_timeout: int = 35,
+        poll_timeout: float = 35,
     ):
         self.account = account
         self.client = client
@@ -59,7 +60,6 @@ class MessagePoller:
         self._loop = None
         self._task = None
         self._thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
 
     @property
     def running(self) -> bool:
@@ -69,7 +69,6 @@ class MessagePoller:
         if self._running:
             return
         self._running = True
-        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._poll_loop,
             name=f"poller-{self.account.bot_id[:8]}",
@@ -80,7 +79,6 @@ class MessagePoller:
 
     def stop(self) -> None:
         self._running = False
-        self._stop_event.set()
         loop, task = self._loop, self._task
         if loop and task:
             try:
@@ -123,11 +121,14 @@ class MessagePoller:
                 except ConnectionInactive:
                     if not connection or not connection.active:
                         break
+                    errors = 0
                 except Exception:
                     if not self._running:
                         break
-                    errors = min(errors + 1, 6)
-                    wait = min(2 ** errors, 60)
+                    errors += 1
+                    wait = 30 if errors >= 3 else 2
+                    if errors >= 3:
+                        errors = 0
                     logger.exception("轮询出错，%d 秒后重试", wait)
                     await asyncio.sleep(wait)
 
@@ -169,8 +170,9 @@ class MessagePoller:
                 self.auth_manager.update_account(self.account)
 
         timeout_hint = response.get("longpolling_timeout_ms")
-        if timeout_hint and isinstance(timeout_hint, int):
-            self.poll_timeout = max(timeout_hint // 1000, 10)
+        if (isinstance(timeout_hint, (int, float)) and not isinstance(timeout_hint, bool)
+                and math.isfinite(timeout_hint) and timeout_hint > 0):
+            self.poll_timeout = timeout_hint / 1000
 
         for raw_msg in response.get("msgs", []):
             if not self._running or (connection and not connection.active):

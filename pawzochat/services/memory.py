@@ -186,7 +186,9 @@ class MemoryService:
         self.llm_manager = llm_manager
         self._locks: dict[str, threading.Lock] = {}
         self._global_lock = threading.Lock()
-        self._llm_semaphore = threading.Semaphore(2)
+        # Shared with group memory: summaries and consolidation call models
+        # one at a time, including across personas and conversations.
+        self._llm_semaphore = threading.Semaphore(1)
         self._consolidating: set[str] = set()
         self._summarizing: set[str] = set()
         self._total_rounds: dict[str, int] = {}
@@ -395,9 +397,15 @@ class MemoryService:
             return ""
         data = self.load_memories(persona_id)
         memories = data.get("memories", [])
+        return self.format_memory_entries(memories, tool_context=tool_context)
+
+    @staticmethod
+    def format_memory_entries(memories: list[dict], *, tool_context: dict | None = None,
+                              title: str = "[历史记忆]", editable: bool = True) -> str:
+        """Render an explicit memory snapshot without choosing its storage scope."""
         if tool_context is not None:
             tool_context["fingerprints"] = {
-                i: self.fingerprint(m) for i, m in enumerate(memories)
+                i: MemoryService.fingerprint(m) for i, m in enumerate(memories)
             }
         if not memories:
             return ""
@@ -408,10 +416,10 @@ class MemoryService:
             key=lambda pair: _clamp_importance(pair[1].get("importance", 3)),
             reverse=True,
         )
-        lines = ["[历史记忆]"]
+        lines = [title]
         for idx, m in sorted_pairs:
             lines.append(
-                f"[记忆 #{idx} - 重要度{_clamp_importance(m.get('importance', 3))} - "
+                f"[{'记忆 #' + str(idx) if editable else '参考记忆'} - 重要度{_clamp_importance(m.get('importance', 3))} - "
                 f"{m.get('created_at', '未知时间')}]"
             )
             lines.append(_sanitize_summary_for_prompt(m.get("summary", "")))
@@ -711,6 +719,7 @@ class MemoryService:
                 self._consolidating.discard(persona_id)
 
     def _consolidate(self, persona_id: str, max_memories: int, persona):
+        task_token = self._background_token(persona_id)
         lock = self._get_lock(persona_id)
         with lock:
             data = self.load_memories(persona_id)
@@ -756,6 +765,7 @@ class MemoryService:
             persona_id=persona_id,
             operation="记忆合并",
             max_tokens=4000,
+            is_cancelled=lambda: not self._background_valid(persona_id, task_token),
         )
         if not result:
             return
@@ -768,6 +778,8 @@ class MemoryService:
 
         expected_counts = Counter(merge_fingerprints)
         with lock:
+            if not self._background_valid(persona_id, task_token):
+                return
             current_settings = self.get_memory_settings(persona_id)
             if not current_settings["enabled"] or current_settings["max_memories"] != max_memories:
                 logger.info("记忆合并设置已变化，跳过写入 persona=%s", persona_id)
@@ -802,6 +814,12 @@ class MemoryService:
 
     # ---- Helpers ----------------------------------------------------------
 
+    def _background_token(self, persona_id):
+        return None
+
+    def _background_valid(self, persona_id, token) -> bool:
+        return True
+
     def _resolve_persona(self, persona_id: str):
         personas = self.config.load_personas()
         return personas.get(persona_id)
@@ -814,6 +832,7 @@ class MemoryService:
         persona_id: str,
         operation: str,
         max_tokens: int,
+        is_cancelled=None,
     ) -> dict | None:
         provider = self.llm_manager.get_provider(persona.llm_provider)
         if not provider:
@@ -822,13 +841,18 @@ class MemoryService:
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
+            if is_cancelled is not None and is_cancelled():
+                return None
             try:
                 response_text = self._call_llm(
                     provider,
                     persona,
                     prompt,
                     max_tokens=max_tokens,
+                    is_cancelled=is_cancelled,
                 )
+                if is_cancelled is not None and is_cancelled():
+                    return None
             except Exception as exc:
                 if attempt < max_attempts:
                     delay = 1.0 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
@@ -872,9 +896,13 @@ class MemoryService:
         prompt: str,
         *,
         max_tokens: int = 2000,
+        is_cancelled=None,
     ) -> str:
         messages = [{"role": "user", "content": prompt}]
         with self._llm_semaphore:
+            # A task may be invalidated while another memory request runs.
+            if is_cancelled is not None and is_cancelled():
+                return ""
             response = provider.chat(
                 messages,
                 model=persona.llm_model or None,

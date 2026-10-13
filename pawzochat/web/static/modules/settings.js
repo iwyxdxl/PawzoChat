@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 import { avatarHtml, formatTime, esc, escAttr, jsArg, iconHtml, voiceOptionsHtml, voiceCatalogFor } from "./utils.js";
+import { mountAccountVoicePicker } from "./voice_picker.js";
 import { api, downloadFile } from "./api.js";
 import { state, $, content, sidebar } from "./state.js";
 import { toast, confirm, showSheet, closeOverlay, showLoading, hideLoading, setOverlayDismissible } from "./ui.js";
@@ -25,7 +26,7 @@ import {
   isDesktop, setSidebarBar, refreshSidebar,
 } from "./navigation.js";
 import { applyThemeFromState, invalidateCache } from "./theme.js";
-import { renderVerifyInput, clearVerifyInput } from "./qr_verify.js";
+import { fetchQrStatus, renderVerifyInput, clearVerifyInput } from "./qr_verify.js";
 import { voiceControlHtml, readVoiceControls, bindVoiceControls, voiceTestEmotionHtml } from "./voice_controls.js";
 
 const _CAM_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></svg>`;
@@ -113,10 +114,10 @@ async function renderSettings() {
         <div class="row-icon blue">${iconHtml("ri-puzzle-line")}</div>
         <span class="row-label">MCP 扩展</span><span class="row-value">${esc(mcpSummary)}</span><span class="row-arrow">›</span>
       </div>
-      ${!isPublic ? `<div class="card-row" onclick="PawzoChat.pushPage('pluginList')">
+      <div class="card-row" onclick="PawzoChat.pushPage('pluginList')">
         <div class="row-icon red">${iconHtml("ri-plug-line")}</div>
         <span class="row-label">插件管理</span><span class="row-arrow">›</span>
-      </div>` : ''}
+      </div>
     </div>
     <div class="card">
       <div class="card-row" onclick="PawzoChat.pushPage('settingsChat')">
@@ -179,26 +180,37 @@ async function renderSettingsAccounts() {
     }
 
     const html = accounts.map((a, idx) => {
-      const status = a.connection_state === "cooldown"
-        ? `<span style="color:var(--text-3)">凭据冷却中</span>`
-        : a.online
-        ? `<span style="color:var(--success)">● 在线</span>`
-        : `<span style="color:var(--text-3)">● 离线</span>`;
-      const displayName = a.note || `Bot: ${a.bot_id.substring(0, 16)}…`;
+      const statusClass = a.connection_state === "cooldown" ? "cooldown" : a.online ? "online" : "offline";
+      const statusLabel = statusClass === "cooldown" ? "凭据冷却中" : a.online ? "在线" : "离线";
+      const status = `<span class="account-card-status ${statusClass}">
+        <span class="account-card-status-dot" aria-hidden="true"></span>${statusLabel}
+      </span>`;
+      const displayName = a.note || a.bot_id;
+      const largeChannelIcon = a.channel_type === "wechat" || a.channel_type === "qq";
+      const channelIcon = a.channel_type === "wechat" ? "ri-wechat-fill"
+        : a.channel_type === "qq" ? "ri-qq-fill"
+        : a.channel_type ? "ri-plug-line" : "ri-smartphone-line";
       const channelTag = a.channel_name
-        ? `<span style="font-size:11px;color:var(--text-3);border:1px solid var(--divider);border-radius:6px;padding:1px 6px;margin-left:6px">${esc(a.channel_name)}</span>`
+        ? `<span class="account-card-channel" title="${escAttr(a.channel_name)}">${esc(a.channel_name)}</span>`
         : "";
       const linked = a.linked_persona
-        ? `已链接到：${esc(personas.find(p => p.id === a.linked_persona)?.name || a.linked_persona)}`
-        : "";
-      return `<div class="card" style="margin:8px 16px">
+        ? `已链接到：${personas.find(p => p.id === a.linked_persona)?.name || a.linked_persona}`
+        : "未链接角色";
+      const createdAt = a.created_at ? formatTime(a.created_at) : "";
+      return `<div class="card account-card">
         <div class="card-row" onclick="PawzoChat.openAccount(${idx})">
-          <div class="row-icon green">${iconHtml("ri-smartphone-line")}</div>
-          <div style="flex:1">
-            <div style="font-size:14px;font-weight:500">${esc(displayName)} ${status}${channelTag}</div>
-            ${a.note ? `<div style="font-size:12px;color:var(--text-3);margin-top:2px">${esc(a.bot_id.substring(0, 20))}…</div>` : ""}
-            ${linked ? `<div style="font-size:12px;color:var(--text-3);margin-top:2px">${linked}</div>` : ""}
-            <div style="font-size:11px;color:var(--text-3);margin-top:2px">${a.created_at ? "创建于 " + formatTime(a.created_at) : ""}</div>
+          <div class="row-icon account-card-icon${largeChannelIcon ? " account-card-icon-large" : ""}">${iconHtml(channelIcon)}</div>
+          <div class="account-card-info">
+            <div class="account-card-name" title="${escAttr(displayName)}">${esc(displayName)}</div>
+            <div class="account-card-details">
+              <div class="account-card-description account-card-id" title="${escAttr(a.bot_id)}">${esc(a.bot_id)}</div>
+              <div class="account-card-description" title="${escAttr(linked)}">${esc(linked)}</div>
+            </div>
+            <div class="account-card-meta">
+              ${channelTag}
+              ${status}
+              ${createdAt ? `<span class="account-card-date" title="创建于 ${escAttr(createdAt)}" aria-label="创建于 ${escAttr(createdAt)}"><span class="account-card-date-label">创建于 </span>${esc(createdAt)}</span>` : ""}
+            </div>
           </div>
           <span class="row-arrow">›</span>
         </div>
@@ -273,7 +285,6 @@ async function startWeChatQrFlow() {
 function showChannelFormSheet(ch) {
   _pendingFormChannel = ch.type;
   _pendingFormFields = ch.fields || [];
-  const inputStyle = "width:100%;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)";
   // Use the field index (not f.key) for DOM ids so a plugin-defined key with
   // unusual characters can't produce a broken id or a lookup that diverges
   // from the rendered element.
@@ -287,17 +298,17 @@ function showChannelFormSheet(ch) {
     const req = f.required ? ` <span style="color:var(--danger)">*</span>` : "";
     return `<div style="margin-bottom:14px">
       <div style="font-size:13px;color:var(--text-2);margin-bottom:6px">${esc(f.label || f.key)}${req}</div>
-      <input id="${id}" type="${inputType}" placeholder="${escAttr(f.placeholder || "")}" style="${inputStyle}">
+      <input class="form-input" id="${id}" type="${inputType}" placeholder="${escAttr(f.placeholder || "")}">
     </div>`;
   }).join("");
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">添加 ${esc(ch.name)} 账号</div>
     ${ch.type === "qq" ? `<div style="font-size:12px;color:var(--text-3);margin:4px 0 14px">前往 <a href="https://q.qq.com/qqbot/openclaw/" target="_blank" rel="noopener" style="color:var(--primary);text-decoration:underline">QQ 开放平台 OpenClaw 机器人配置页面</a> 获取 AppID 和 AppSecret，并开通 C2C 私信消息权限</div>` : (ch.hint ? `<div style="font-size:12px;color:var(--text-3);margin:4px 0 14px">${esc(ch.hint)}</div>` : "")}
     ${fieldsHtml}
     <div id="acct-form-err" style="color:var(--danger);font-size:13px;margin-bottom:10px;display:none"></div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.submitFormAccount()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">添加</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.submitFormAccount()">添加</button>
     </div>
   </div>`);
 }
@@ -348,40 +359,47 @@ let _qrPollBaseUrl = "";
 let _qrVerifyCode = "";
 let _qrPolling = false;
 
-async function pollQrStatus(qrcode) {
+async function pollQrStatus(qrcode, deadline = Date.now() + 5 * 60 * 1000) {
   if (!_qrPolling) return;
   const el = $("qr-poll-status");
   if (!el) { _qrPolling = false; return; }
+  const finish = (message) => {
+    _qrPolling = false;
+    _qrVerifyCode = "";
+    _qrPollBaseUrl = "";
+    clearVerifyInput(el);
+    el.textContent = message;
+  };
+
   try {
-    let url = `/api/accounts/qr/status?qrcode=${qrcode}`;
-    if (_qrPollBaseUrl) url += `&base_url=${encodeURIComponent(_qrPollBaseUrl)}`;
-    if (_qrVerifyCode) {
-      // Consume the code: one submission = one server-side attempt, so a wrong
-      // code isn't re-sent every 2s (which would burn through the retry limit).
-      url += `&verify_code=${encodeURIComponent(_qrVerifyCode)}`;
-      _qrVerifyCode = "";
-    }
-    const res = await api.get(url, { bypassCache: true });
+    // One submission consumes the code even when the request fails.
+    const verifyCode = _qrVerifyCode;
+    _qrVerifyCode = "";
+    const res = await fetchQrStatus(qrcode, _qrPollBaseUrl, verifyCode, deadline);
     if (!_qrPolling || $("qr-poll-status") !== el) return;
+    if (res.status === "local_timeout") {
+      finish("等待已超时，请重新开始连接");
+      return;
+    }
+    if (res.status === "error" || res.retryable === false) {
+      finish(res.errmsg || res.error || "连接未完成，请重新开始");
+      return;
+    }
+    if (res.retryable && res.error_kind !== "timeout") {
+      el.textContent = res.errmsg || "连接暂时中断，正在重试…";
+    }
     if (res.status === "binded_redirect") {
-      _qrPolling = false;
-      _qrPollBaseUrl = "";
-      _qrVerifyCode = "";
-      clearVerifyInput(el);
-      if (el) el.textContent = "该微信已连接，无需重复添加";
+      finish("该微信已连接，无需重复添加");
       setTimeout(() => {
         if ($("qr-poll-status") === el) { closeOverlay(); renderSettingsAccounts(); }
       }, 800);
       return;
     }
     if (res.status === "confirmed") {
-      _qrPolling = false;
-      if (el) el.textContent = "登录成功！";
-      _qrPollBaseUrl = "";
-      _qrVerifyCode = "";
-      clearVerifyInput(el);
+      finish("登录成功！");
       const botId = res.bot_id || "";
       setTimeout(() => {
+        if ($("qr-poll-status") !== el) return;
         closeOverlay();
         if (botId) {
           _pendingNoteBotId = botId;
@@ -392,44 +410,36 @@ async function pollQrStatus(qrcode) {
       }, 800);
       return;
     }
-    if (res.status === "scaned" || res.status === "scanned") {
-      if (el) el.textContent = "扫描成功，请在手机上确认";
+    if (res.status === "scaned") {
+      el.textContent = "扫描成功，请在手机上确认";
     } else if (res.status === "scaned_but_redirect") {
-      if (el) el.textContent = "扫描成功，正在切换线路…";
+      el.textContent = "扫描成功，正在切换线路…";
       const host = res.redirect_host;
       if (host) _qrPollBaseUrl = `https://${host}`;
     } else if (res.status === "need_verifycode") {
-      if (el) {
-        el.textContent = "请输入手机上显示的验证码";
-        renderVerifyInput(el, (code) => { _qrVerifyCode = code; });
-      }
+      el.textContent = "请输入手机上显示的验证码";
+      renderVerifyInput(el, (code) => { _qrVerifyCode = code; });
     } else if (res.status === "verify_code_blocked") {
-      _qrPolling = false;
-      _qrVerifyCode = "";
-      if (el) { clearVerifyInput(el); el.textContent = "验证码错误次数过多，请重新添加"; }
-      _qrPollBaseUrl = "";
+      finish("验证码错误次数过多，请重新开始");
       return;
     } else if (res.status === "expired") {
-      _qrPolling = false;
-      if (el) { clearVerifyInput(el); el.textContent = "二维码已过期，请重新添加"; }
-      _qrPollBaseUrl = "";
+      finish("二维码已过期，请重新开始");
       return;
     }
   } catch (e) { /* silent */ }
-  setTimeout(() => { if ($("qr-poll-status") === el) pollQrStatus(qrcode); }, 2000);
+  setTimeout(() => { if ($("qr-poll-status") === el) pollQrStatus(qrcode, deadline); }, 2000);
 }
 
 function showNoteSheet() {
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">设置账号备注</div>
     <div style="font-size:13px;color:var(--text-3);text-align:center;margin-bottom:16px">为新添加的账号设置一个易于识别的名称</div>
     <div style="margin-bottom:20px">
-      <input id="new-acct-note" placeholder="输入备注名"
-        style="width:100%;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+      <input class="form-input" id="new-acct-note" placeholder="输入备注名">
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.skipAccountNote()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">跳过</button>
-      <button onclick="PawzoChat.confirmAccountNote()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">保存</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.skipAccountNote()">跳过</button>
+      <button class="btn-primary" onclick="PawzoChat.confirmAccountNote()">保存</button>
     </div>
   </div>`, () => {
     _pendingNoteBotId = null;
@@ -462,7 +472,7 @@ function renderAccountDetail(data) {
     : "未链接";
 
   setTopBar("账号详情", true,
-    `<button class="btn-text" onclick="PawzoChat.saveAccountNote()" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.saveAccountNote()">保存</button>`
   );
   const vs = "flex:1;text-align:right;font-size:14px;color:var(--text-2)";
   content().innerHTML = `<div class="page">
@@ -598,7 +608,7 @@ export function openProviderTypeSheet() {
 async function renderProviderEdit(data) {
   const isNew = data.isNew;
   setTopBar(isNew ? "新建对话服务商" : "编辑对话服务商", true,
-    `<button class="btn-text" onclick="PawzoChat.saveProvider(${isNew},'${esc(data.name || "")}')" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.saveProvider(${isNew},'${esc(data.name || "")}')">保存</button>`
   );
 
   let p = { name: "", preset: "", type: "openai_compatible", base_url: "", api_key_set: false, append_chat_path: true, models: [] };
@@ -763,15 +773,15 @@ export function importPresetModels() {
 export function fetchRemoteModels() {
   const baseUrl = ($("pv-url")?.value || "").trim().replace(/\/+$/, "");
   const defaultUrl = baseUrl ? baseUrl + "/models" : "";
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">拉取模型</div>
-    <div style="display:flex;flex-direction:column;gap:12px;margin:16px 0">
+    <div class="form-stack" style="margin:16px 0">
       <div style="font-size:13px;color:var(--text-2)">输入模型列表 API 地址：</div>
-      <input id="fetch-models-url" value="${esc(defaultUrl)}" placeholder="https://api.example.com/v1/models" style="border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+      <input class="form-input" id="fetch-models-url" value="${esc(defaultUrl)}" placeholder="https://api.example.com/v1/models">
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.confirmFetchModels()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">拉取</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.confirmFetchModels()">拉取</button>
     </div>
   </div>`);
 }
@@ -825,7 +835,7 @@ function _showModelSelectionSheet() {
     </label>`;
   }).join("");
 
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">选择要导入的模型</div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin:8px 0">
       <span style="font-size:13px;color:var(--text-3)">共 ${_fetchedModels.length} 个模型</span>
@@ -834,9 +844,9 @@ function _showModelSelectionSheet() {
       </label>
     </div>
     <div id="fetch-model-list" style="overflow-y:auto;-webkit-overflow-scrolling:touch">${rows}</div>
-    <div style="display:flex;gap:12px;margin-top:16px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.confirmModelSelection()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">导入</button>
+    <div class="form-actions mt-16">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.confirmModelSelection()">导入</button>
     </div>
   </div>`, () => {
     document.getElementById("action-sheet").style.overflowY = "";
@@ -891,24 +901,24 @@ export function confirmModelSelection() {
 }
 
 export function addEditModel() {
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">添加模型</div>
-    <div style="display:flex;flex-direction:column;gap:12px;margin:16px 0">
-      <input id="add-model-id" placeholder="模型 ID (必填，如 gpt-4o)" style="border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
-      <input id="add-model-name" placeholder="显示名称 (可选)" style="border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+    <div class="form-stack" style="margin:16px 0">
+      <input class="form-input" id="add-model-id" placeholder="模型 ID (必填，如 gpt-4o)">
+      <input class="form-input" id="add-model-name" placeholder="显示名称 (可选)">
       <div style="font-size:13px;color:var(--text-2)">能力标记 (勾选适用项):</div>
       <div style="display:flex;gap:12px;flex-wrap:wrap">
-        <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" id="add-cap-vision"> 视觉</label>
-        <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" id="add-cap-tool" checked> 工具调用</label>
+        <label><input type="checkbox" id="add-cap-vision"> 视觉</label>
+        <label><input type="checkbox" id="add-cap-tool" checked> 工具调用</label>
       </div>
-      <div style="display:flex;gap:8px">
-        <input id="add-model-ctx" type="number" placeholder="上下文窗口 (可选)" style="flex:1;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
-        <input id="add-model-out" type="number" placeholder="最大输出 (可选)" style="flex:1;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+      <div class="form-columns">
+        <input class="form-input" id="add-model-ctx" type="number" placeholder="上下文窗口 (可选)">
+        <input class="form-input" id="add-model-out" type="number" placeholder="最大输出 (可选)">
       </div>
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.confirmAddModel()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">添加</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.confirmAddModel()">添加</button>
     </div>
   </div>`);
 }
@@ -943,24 +953,24 @@ export function editModel(idx) {
   if (!m) return;
   const hasVision = (m.capabilities || []).includes("vision");
   const hasTool = (m.capabilities || []).includes("tool_use");
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">编辑模型</div>
-    <div style="display:flex;flex-direction:column;gap:12px;margin:16px 0">
-      <input id="edit-model-id" value="${esc(m.id)}" placeholder="模型 ID (必填，如 gpt-4o)" style="border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
-      <input id="edit-model-name" value="${esc(m.name || '')}" placeholder="显示名称 (可选)" style="border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+    <div class="form-stack" style="margin:16px 0">
+      <input class="form-input" id="edit-model-id" value="${esc(m.id)}" placeholder="模型 ID (必填，如 gpt-4o)">
+      <input class="form-input" id="edit-model-name" value="${esc(m.name || '')}" placeholder="显示名称 (可选)">
       <div style="font-size:13px;color:var(--text-2)">能力标记 (勾选适用项):</div>
       <div style="display:flex;gap:12px;flex-wrap:wrap">
-        <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" id="edit-cap-vision" ${hasVision ? 'checked' : ''}> 视觉</label>
-        <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" id="edit-cap-tool" ${hasTool ? 'checked' : ''}> 工具调用</label>
+        <label><input type="checkbox" id="edit-cap-vision" ${hasVision ? 'checked' : ''}> 视觉</label>
+        <label><input type="checkbox" id="edit-cap-tool" ${hasTool ? 'checked' : ''}> 工具调用</label>
       </div>
-      <div style="display:flex;gap:8px">
-        <input id="edit-model-ctx" type="number" value="${m.context_window || ''}" placeholder="上下文窗口 (可选)" style="flex:1;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
-        <input id="edit-model-out" type="number" value="${m.max_output || ''}" placeholder="最大输出 (可选)" style="flex:1;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+      <div class="form-columns">
+        <input class="form-input" id="edit-model-ctx" type="number" value="${m.context_window || ''}" placeholder="上下文窗口 (可选)">
+        <input class="form-input" id="edit-model-out" type="number" value="${m.max_output || ''}" placeholder="最大输出 (可选)">
       </div>
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.confirmEditModel(${idx})" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">保存</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.confirmEditModel(${idx})">保存</button>
     </div>
   </div>`);
 }
@@ -1139,7 +1149,7 @@ export function openImageProviderTypeSheet() {
 async function renderImageProviderEdit(data) {
   const isNew = data.isNew;
   setTopBar(isNew ? "新建生图服务商" : "编辑生图服务商", true,
-    `<button class="btn-text" onclick="PawzoChat.saveImageProvider(${isNew},'${esc(data.name || "")}')" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.saveImageProvider(${isNew},'${esc(data.name || "")}')">保存</button>`
   );
 
   let p = { name: "", preset: "", type: "openai_image", base_url: "", api_key_set: false, models: [] };
@@ -1282,20 +1292,19 @@ export function importImagePresetModels() {
 export function addEditImageModel() {
   const preset = $("ipv-preset")?.value || "custom";
   const defaultType = _imageDefaultTypeForPreset(preset);
-  const inputStyle = "border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)";
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">添加模型</div>
-    <div style="display:flex;flex-direction:column;gap:12px;margin:16px 0">
-      <input id="add-img-model-id" placeholder="模型 ID (必填，如 gpt-image-1)" style="${inputStyle}">
-      <input id="add-img-model-name" placeholder="显示名称 (可选)" style="${inputStyle}">
+    <div class="form-stack" style="margin:16px 0">
+      <input class="form-input" id="add-img-model-id" placeholder="模型 ID (必填，如 gpt-image-1)">
+      <input class="form-input" id="add-img-model-name" placeholder="显示名称 (可选)">
       <div>
         <div style="font-size:12px;color:var(--text-3);margin-bottom:4px">调用方式</div>
-        <select id="add-img-model-type" style="${inputStyle};width:100%">${_imageModelTypeOptionsHTML(defaultType)}</select>
+        <select class="form-input" id="add-img-model-type">${_imageModelTypeOptionsHTML(defaultType)}</select>
       </div>
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.confirmAddImageModel()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">添加</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.confirmAddImageModel()">添加</button>
     </div>
   </div>`);
 }
@@ -1323,20 +1332,19 @@ export function editImageModel(idx) {
   if (!m) return;
   const preset = $("ipv-preset")?.value || "custom";
   const currentType = m.type || _imageDefaultTypeForPreset(preset);
-  const inputStyle = "border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)";
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">编辑模型</div>
-    <div style="display:flex;flex-direction:column;gap:12px;margin:16px 0">
-      <input id="edit-img-model-id" value="${esc(m.id)}" placeholder="模型 ID (必填)" style="${inputStyle}">
-      <input id="edit-img-model-name" value="${esc(m.name || '')}" placeholder="显示名称 (可选)" style="${inputStyle}">
+    <div class="form-stack" style="margin:16px 0">
+      <input class="form-input" id="edit-img-model-id" value="${esc(m.id)}" placeholder="模型 ID (必填)">
+      <input class="form-input" id="edit-img-model-name" value="${esc(m.name || '')}" placeholder="显示名称 (可选)">
       <div>
         <div style="font-size:12px;color:var(--text-3);margin-bottom:4px">调用方式</div>
-        <select id="edit-img-model-type" style="${inputStyle};width:100%">${_imageModelTypeOptionsHTML(currentType)}</select>
+        <select class="form-input" id="edit-img-model-type">${_imageModelTypeOptionsHTML(currentType)}</select>
       </div>
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.confirmEditImageModel(${idx})" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">保存</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.confirmEditImageModel(${idx})">保存</button>
     </div>
   </div>`);
 }
@@ -1467,13 +1475,13 @@ async function renderImageTest() {
         <select id="it-persona" onchange="PawzoChat.onImageTestPersonaChange()">${personaOpts}</select>
       </div></div>
       <div class="form-hint">选择角色后，按该角色的"生图设置"自动注入参考图</div>
-      <div class="form-group"><div class="form-row" style="flex-direction:column;align-items:flex-start;gap:6px;padding:12px 16px">
-        <label style="font-size:13px;color:var(--text-2)">提示词</label>
-        <textarea id="it-prompt" rows="3" oninput="PawzoChat.onImageTestPromptInput()" style="width:100%;box-sizing:border-box;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1);resize:vertical">${esc(_imageTestState.prompt)}</textarea>
-      </div></div>
+      <div class="prompt-field">
+        <label class="prompt-label" for="it-prompt">提示词</label>
+        <textarea class="prompt-input" id="it-prompt" rows="3" oninput="PawzoChat.onImageTestPromptInput()">${esc(_imageTestState.prompt)}</textarea>
+      </div>
     </div>
     <div class="persona-actions mt-16">
-      <button class="btn-primary" style="width:100%" onclick="PawzoChat.runImageTest()">开始生成</button>
+      <button class="btn-primary" onclick="PawzoChat.runImageTest()">开始生成</button>
     </div>
     <div id="it-result" style="margin:16px"></div>
   </div>`;
@@ -1553,13 +1561,15 @@ let _voiceProviderPresets = {};
 let _voicePresetModels = {};
 let _voiceModelTypeOptions = [];
 let _editVoiceModels = [];
+let _editVoiceProvider = null;
 let _voicePresetVoices = {};
 
 function _voicePresetLabel(id) {
-  return _voiceProviderPresets[id]?.name || id;
+  return _voiceProviderPresets[id]?.name || (id === "custom" ? "自定义" : id);
 }
 
 const _VOICE_TYPE_SHORT_LABEL = {
+  elevenlabs_tts: "ElevenLabs 原生",
   minimaxi_tts: "MiniMax 原生",
   mimo_tts: "MiMo 原生",
   openai_tts: "OpenAI 兼容",
@@ -1612,31 +1622,25 @@ async function renderSettingsVoiceProviders() {
       </div>`;
       return;
     }
-    const testEntryCard = `<div class="card" style="margin:8px 16px;cursor:pointer" onclick="PawzoChat.openVoiceTest()">
-      <div style="padding:14px 16px;display:flex;align-items:center;gap:12px">
-        <div style="width:36px;height:36px;border-radius:8px;background:var(--primary-light);display:flex;align-items:center;justify-content:center;color:var(--primary);flex-shrink:0">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+    const testEntryCard = `<div class="card">
+      <div class="card-row" onclick="PawzoChat.openVoiceTest()">
+        <span class="row-icon primary">${iconHtml("ri-mic-line")}</span>
+        <div class="provider-summary">
+          <div class="row-label">语音测试</div>
+          <div class="form-label-secondary">选择服务商和模型试听语音</div>
         </div>
-        <div style="flex:1;min-width:0">
-          <div style="font-size:15px;font-weight:600">语音测试</div>
-          <div style="font-size:12px;color:var(--text-3);margin-top:2px">选择服务商和模型测试 TTS 调用</div>
-        </div>
-        <span style="color:var(--text-3);font-size:18px">›</span>
+        <span class="row-arrow">›</span>
       </div>
     </div>`;
     const html = providers.map(p => {
-      const presetLabel = _voicePresetLabel(p.preset);
-      const tag = p.preset !== "custom"
-        ? `<span style="font-size:11px;color:var(--primary);background:var(--primary-light);padding:1px 6px;border-radius:4px">${esc(presetLabel)}</span>`
-        : `<span style="font-size:11px;color:var(--text-3)">自定义</span>`;
       const modelCount = (p.models || []).length;
-      return `<div class="card" style="margin:8px 16px;cursor:pointer" onclick="PawzoChat.pushPage('voiceProviderEdit',{name:'${esc(p.name)}'})">
-        <div style="padding:14px 16px">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <span style="font-size:15px;font-weight:600">${esc(p.name)}</span>
-            ${tag}
+      return `<div class="card">
+        <div class="card-row" onclick="PawzoChat.pushPage('voiceProviderEdit',{name:'${esc(p.name)}'})">
+          <div class="provider-summary">
+            <div class="row-label">${esc(p.name)}</div>
+            <div class="form-label-secondary">${esc(_voicePresetLabel(p.preset))} · ${modelCount} 个模型</div>
           </div>
-          <div style="font-size:13px;color:var(--text-2);margin-top:4px">${modelCount} 个模型</div>
+          <span class="row-arrow">›</span>
         </div>
       </div>`;
     }).join("");
@@ -1649,16 +1653,17 @@ export function openVoiceProviderTypeSheet() {
   const items = ids.map(id =>
     `<div class="sheet-item" onclick="PawzoChat.closeOverlay();PawzoChat.pushPage('voiceProviderEdit',{isNew:true,preset:'${esc(id)}'})">${esc(_voicePresetLabel(id))}</div>`
   ).join("");
-  const customItem = `<div class="sheet-item" onclick="PawzoChat.closeOverlay();PawzoChat.pushPage('voiceProviderEdit',{isNew:true,preset:'custom'})">自定义 (OpenAI 兼容)</div>`;
+  const customItem = `<div class="sheet-item" onclick="PawzoChat.closeOverlay();PawzoChat.pushPage('voiceProviderEdit',{isNew:true,preset:'custom'})">自定义</div>`;
   showSheet(`<div class="sheet-title">选择语音服务商类型</div>${items}${customItem}<div class="sheet-cancel" onclick="PawzoChat.closeOverlay()">取消</div>`);
 }
 
 async function renderVoiceProviderEdit(data) {
   const isNew = data.isNew;
   setTopBar(isNew ? "新建语音服务商" : "编辑语音服务商", true,
-    `<button class="btn-text" onclick="PawzoChat.saveVoiceProvider(${isNew},'${esc(data.name || "")}')" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.saveVoiceProvider(${isNew},'${esc(data.name || "")}')">保存</button>`
   );
 
+  content().innerHTML = `<div class="loading-center"><div class="spinner"></div></div>`;
   let p = { name: "", preset: "", type: "openai_tts", base_url: "", api_key_set: false, models: [] };
 
   try {
@@ -1674,12 +1679,13 @@ async function renderVoiceProviderEdit(data) {
 
   if (isNew && data.preset) p.preset = data.preset;
 
+  _editVoiceProvider = isNew ? null : p;
   _editVoiceModels = JSON.parse(JSON.stringify(p.models || []));
 
   const presetOpts = Object.keys(_voiceProviderPresets)
     .map(id => `<option value="${id}" ${p.preset === id ? "selected" : ""}>${esc(_voicePresetLabel(id))}</option>`)
     .join("")
-    + `<option value="custom" ${(!p.preset || p.preset === "custom") ? "selected" : ""}>自定义 (OpenAI 兼容)</option>`;
+    + `<option value="custom" ${(!p.preset || p.preset === "custom") ? "selected" : ""}>自定义</option>`;
 
   const isCustom = !p.preset || p.preset === "custom";
 
@@ -1687,22 +1693,20 @@ async function renderVoiceProviderEdit(data) {
     <div class="card">
       <div class="form-group"><div class="form-row"><label>服务商</label><select id="vpv-preset" onchange="PawzoChat.onVoiceProviderPresetChange()">${presetOpts}</select></div></div>
       <div class="form-group"><div class="form-row"><label>名称</label><input id="vpv-name" value="${esc(isNew && !isCustom && p.preset ? (_voiceProviderPresets[p.preset]?.default_name || _voiceProviderPresets[p.preset]?.name || "") : p.name)}" placeholder="语音服务商名称"></div></div>
-      <div id="vpv-custom-fields" style="${isCustom ? "" : "display:none"}">
-        <div class="form-group"><div class="form-row" style="padding-bottom:4px"><label>Base URL</label><input id="vpv-url" value="${esc(p.base_url)}" placeholder="https://api.example.com/v1" oninput="PawzoChat.updateVoiceProviderPreview()"></div><div class="form-hint" style="line-height:1.5">同一服务商的不同模型可走不同接口，请在每个模型上单独设置「调用方式」。</div></div>
+      <div id="vpv-custom-fields" ${isCustom ? "" : "hidden"}>
+        <div class="form-group"><div class="form-row"><label>Base URL</label><input id="vpv-url" value="${esc(p.base_url)}" placeholder="https://api.example.com/v1" oninput="PawzoChat.updateVoiceProviderPreview()"></div><div class="form-hint">同一服务商的不同模型可走不同接口，请在每个模型上单独设置「调用方式」。</div></div>
       </div>
       <div class="form-group"><div class="form-row"><label>API Key</label><input type="password" id="vpv-key" placeholder="${p.api_key_set ? '已设置 (留空不修改)' : '输入 API Key'}"></div></div>
     </div>
-    <div class="card" style="margin-top:12px">
-      <div class="form-group"><div class="form-row" style="flex-direction:column;align-items:flex-start;gap:4px">
-        <label style="color:var(--text-3);font-size:12px">请求地址预览</label>
-        <span id="vpv-preview" style="font-size:13px;color:var(--text-2);word-break:break-all"></span>
-      </div></div>
+    <div class="card">
+      <div class="card-header">请求地址预览</div>
+      <div id="vpv-preview" class="form-hint provider-url-preview"></div>
     </div>
-    <div class="card" style="margin-top:12px">
-      <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
-        <span>模型列表</span>
-        <div style="display:flex;gap:8px">
-          <button id="vpv-import-preset-btn" class="btn-outline btn-sm" onclick="PawzoChat.importVoicePresetModels()" style="${isCustom ? 'display:none' : ''}">导入预设</button>
+    <div class="card">
+      <div class="card-header-row provider-model-header">
+        <span class="card-header">模型列表</span>
+        <div class="form-actions">
+          <button id="vpv-import-preset-btn" class="btn-outline btn-sm" onclick="PawzoChat.importVoicePresetModels()" ${isCustom ? 'hidden' : ''}>导入预设</button>
           <button class="btn-outline btn-sm" onclick="PawzoChat.addEditVoiceModel()">添加</button>
         </div>
       </div>
@@ -1725,22 +1729,22 @@ function _renderVoiceModelsList() {
   const el = $("vpv-models-list");
   if (!el) return;
   if (_editVoiceModels.length === 0) {
-    el.innerHTML = `<div style="padding:16px;text-align:center;color:var(--text-3);font-size:13px">暂无模型，点击"导入预设"或"添加"</div>`;
+    el.innerHTML = `<div class="card-empty-hint">暂无模型，点击"导入预设"或"添加"</div>`;
     return;
   }
   el.innerHTML = _editVoiceModels.map((m, i) => {
-    const typeTag = `<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:var(--bg);color:var(--text-2);border:1px solid var(--divider)">${esc(_voiceTypeLabel(m.type))}</span>`;
-    const voiceTag = m.voice ? `<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:var(--bg);color:var(--primary);border:1px solid var(--primary)" title="默认音色">${esc(m.voice)}</span>` : "";
-    return `<div class="model-row" style="padding:10px 16px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--divider)">
-      <div style="flex:1;min-width:0">
-        <div style="font-size:14px;font-weight:500;display:flex;align-items:center;gap:6px;flex-wrap:wrap">${esc(m.name || m.id)} ${typeTag} ${voiceTag}</div>
-        <div style="font-size:12px;color:var(--text-3);margin-top:2px">${esc(m.id)}</div>
+    return `<div class="form-group model-row"><div class="form-row">
+      <div class="provider-summary">
+        <div>${esc(m.name || m.id)}</div>
+        <div class="form-label-secondary">${esc(m.id)}</div>
+        <span class="cap-tag">${esc(_voiceTypeLabel(m.type))}</span>
+        ${m.voice ? `<div class="form-label-secondary">默认音色：${esc(m.voice)}</div>` : ""}
       </div>
-      <div style="display:flex;gap:4px;align-items:center">
-        <button class="btn-icon-sm" onclick="PawzoChat.editVoiceModel(${i})" title="编辑" style="font-size:14px">${iconHtml("ri-edit-line")}</button>
+      <div class="form-actions">
+        <button class="btn-icon-sm" onclick="PawzoChat.editVoiceModel(${i})" title="编辑">${iconHtml("ri-edit-line")}</button>
         <button class="btn-icon-sm" onclick="PawzoChat.removeEditVoiceModel(${i})" title="删除">&times;</button>
       </div>
-    </div>`;
+    </div></div>`;
   }).join("");
 }
 
@@ -1748,9 +1752,9 @@ export function onVoiceProviderPresetChange() {
   const preset = $("vpv-preset").value;
   const isCustom = preset === "custom";
   const fields = $("vpv-custom-fields");
-  if (fields) fields.style.display = isCustom ? "" : "none";
+  if (fields) fields.hidden = !isCustom;
   const importBtn = $("vpv-import-preset-btn");
-  if (importBtn) importBtn.style.display = isCustom ? "none" : "";
+  if (importBtn) importBtn.hidden = isCustom;
 
   if (!isCustom) {
     const info = _voiceProviderPresets[preset];
@@ -1801,26 +1805,41 @@ export function importVoicePresetModels() {
 export function addEditVoiceModel() {
   const preset = $("vpv-preset")?.value || "custom";
   const defaultType = _voiceDefaultTypeForPreset(preset);
-  const inputStyle = "border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)";
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body form-stack voice-model-sheet">
     <div class="sheet-title">添加模型</div>
-    <div style="display:flex;flex-direction:column;gap:12px;margin:16px 0">
-      <input id="add-voice-model-id" placeholder="模型 ID (必填，如 tts-1)" style="${inputStyle}">
-      <input id="add-voice-model-name" placeholder="显示名称 (可选)" style="${inputStyle}">
+    <div class="form-stack">
+      <input class="form-input" id="add-voice-model-id" placeholder="模型 ID (必填，如 tts-1)">
+      <input class="form-input" id="add-voice-model-name" placeholder="显示名称 (可选)">
       <div>
-        <div style="font-size:12px;color:var(--text-3);margin-bottom:4px">调用方式</div>
-        <select id="add-voice-model-type" style="${inputStyle};width:100%">${_voiceModelTypeOptionsHTML(defaultType)}</select>
+        <label class="prompt-label" for="add-voice-model-type">调用方式</label>
+        <select class="form-input" id="add-voice-model-type" onchange="PawzoChat.refreshModelVoicePicker('add')">${_voiceModelTypeOptionsHTML(defaultType)}</select>
       </div>
       <div>
-        <div style="font-size:12px;color:var(--text-3);margin-bottom:4px">默认音色 (voice ID, 可选)</div>
-        <input id="add-voice-model-voice" placeholder="留空则在调用时手动指定" style="${inputStyle}">
+        <label class="prompt-label" for="add-voice-model-voice">默认音色 (voice ID, 可选)</label>
+        <input class="form-input" id="add-voice-model-voice" placeholder="留空则在调用时手动指定" spellcheck="false" autocomplete="off">
+        <div id="add-account-voices" hidden></div>
       </div>
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.confirmAddVoiceModel()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">添加</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.confirmAddVoiceModel()">添加</button>
     </div>
   </div>`);
+  refreshModelVoicePicker("add");
+}
+
+export function refreshModelVoicePicker(prefix) {
+  const saved = _editVoiceProvider;
+  const preset = $("vpv-preset")?.value;
+  const unchanged = saved && saved.api_key_set && !$("vpv-key")?.value
+    && (saved.preset === "elevenlabs" || saved.models?.some(m => m.type === "elevenlabs_tts"))
+    && preset === saved.preset && $("vpv-name")?.value.trim() === saved.name
+    && (preset !== "custom" || $("vpv-url")?.value.trim() === saved.base_url);
+  mountAccountVoicePicker($(`${prefix}-account-voices`), {
+    provider: saved?.name, saved: !!unchanged,
+    enabled: $(`${prefix}-voice-model-type`)?.value === "elevenlabs_tts",
+    input: $(`${prefix}-voice-model-voice`),
+  });
 }
 
 export function confirmAddVoiceModel() {
@@ -1849,26 +1868,27 @@ export function editVoiceModel(idx) {
   if (!m) return;
   const preset = $("vpv-preset")?.value || "custom";
   const currentType = m.type || _voiceDefaultTypeForPreset(preset);
-  const inputStyle = "border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)";
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body form-stack voice-model-sheet">
     <div class="sheet-title">编辑模型</div>
-    <div style="display:flex;flex-direction:column;gap:12px;margin:16px 0">
-      <input id="edit-voice-model-id" value="${esc(m.id)}" placeholder="模型 ID (必填)" style="${inputStyle}">
-      <input id="edit-voice-model-name" value="${esc(m.name || '')}" placeholder="显示名称 (可选)" style="${inputStyle}">
+    <div class="form-stack">
+      <input class="form-input" id="edit-voice-model-id" value="${esc(m.id)}" placeholder="模型 ID (必填)">
+      <input class="form-input" id="edit-voice-model-name" value="${esc(m.name || '')}" placeholder="显示名称 (可选)">
       <div>
-        <div style="font-size:12px;color:var(--text-3);margin-bottom:4px">调用方式</div>
-        <select id="edit-voice-model-type" style="${inputStyle};width:100%">${_voiceModelTypeOptionsHTML(currentType)}</select>
+        <label class="prompt-label" for="edit-voice-model-type">调用方式</label>
+        <select class="form-input" id="edit-voice-model-type" onchange="PawzoChat.refreshModelVoicePicker('edit')">${_voiceModelTypeOptionsHTML(currentType)}</select>
       </div>
       <div>
-        <div style="font-size:12px;color:var(--text-3);margin-bottom:4px">默认音色 (voice ID, 可选)</div>
-        <input id="edit-voice-model-voice" value="${esc(m.voice || '')}" placeholder="留空则在调用时手动指定" style="${inputStyle}">
+        <label class="prompt-label" for="edit-voice-model-voice">默认音色 (voice ID, 可选)</label>
+        <input class="form-input" id="edit-voice-model-voice" value="${esc(m.voice || '')}" placeholder="留空则在调用时手动指定" spellcheck="false" autocomplete="off">
+        <div id="edit-account-voices" hidden></div>
       </div>
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.confirmEditVoiceModel(${idx})" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">保存</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.confirmEditVoiceModel(${idx})">保存</button>
     </div>
   </div>`);
+  refreshModelVoicePicker("edit");
 }
 
 export function confirmEditVoiceModel(idx) {
@@ -1953,7 +1973,8 @@ async function renderVoiceTest() {
     const defaults = res.voice_defaults || {};
     _voiceTestState.settings = { ...defaults, ..._voiceTestState.settings,
       minimax: { ...defaults.minimax, ..._voiceTestState.settings.minimax },
-      mimo: { ...defaults.mimo, ..._voiceTestState.settings.mimo } };
+      mimo: { ...defaults.mimo, ..._voiceTestState.settings.mimo },
+      elevenlabs: { ...defaults.elevenlabs, ..._voiceTestState.settings.elevenlabs } };
     _voiceProviderPresets = res.presets || _voiceProviderPresets;
     _voicePresetModels = res.preset_models || _voicePresetModels;
     _voiceModelTypeOptions = res.model_type_options || _voiceModelTypeOptions;
@@ -2002,22 +2023,22 @@ async function renderVoiceTest() {
       <div class="form-group"><div class="form-row"><label>模型</label>
         <select id="vt-model" onchange="PawzoChat.onVoiceTestModelChange()">${modelOpts}</select>
       </div></div>
-      <div class="form-group"><div class="form-row"><label style="padding-right:12px">音色 (voice ID)</label>
-        <input id="vt-voice" list="vt-voice-list" oninput="PawzoChat.onVoiceTestVoiceChange()" value="${esc(currentVoice)}" placeholder="留空则使用模型默认音色" style="flex:1;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
-      </div></div>
-      <datalist id="vt-voice-list">${voiceOpts}</datalist>
-      <div class="form-hint">以下参数仅用于试听，不修改人设或服务商配置。</div>
+      <div class="prompt-field voice-field"><label class="prompt-label" for="vt-voice">音色 (voice ID)</label>
+        <input class="form-input" id="vt-voice" list="vt-voice-list" oninput="PawzoChat.onVoiceTestVoiceChange()" value="${esc(currentVoice)}" placeholder="留空则使用模型默认音色" spellcheck="false" autocomplete="off">
+        <datalist id="vt-voice-list">${voiceOpts}</datalist>
+        <div id="vt-account-voices" hidden></div>
+      </div>
+      <div class="form-hint">以下参数仅用于试听。</div>
       <div id="vt-controls"></div>
       <div id="vt-emotion-control"></div>
-      <div class="form-group"><div class="form-row" style="flex-direction:column;align-items:flex-start;gap:6px;padding:12px 16px">
-        <label style="font-size:13px;color:var(--text-2)">合成文本</label>
-        <textarea id="vt-text" rows="3" oninput="PawzoChat.onVoiceTestTextInput()" style="width:100%;box-sizing:border-box;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1);resize:vertical">${esc(_voiceTestState.text)}</textarea>
-      </div></div>
+      <div class="prompt-field"><label class="prompt-label" for="vt-text">合成文本</label>
+        <textarea class="prompt-input" id="vt-text" rows="3" oninput="PawzoChat.onVoiceTestTextInput()">${esc(_voiceTestState.text)}</textarea>
+      </div>
     </div>
     <div class="persona-actions mt-16">
-      <button id="vt-generate" class="btn-primary" style="width:100%" onclick="PawzoChat.runVoiceTest()">生成语音</button>
+      <button id="vt-generate" class="btn-primary" onclick="PawzoChat.runVoiceTest()">生成语音</button>
     </div>
-    <div id="vt-result" style="margin:16px"></div>
+    <div id="vt-result" class="voice-test-result mt-16" aria-live="polite"></div>
   </div>`;
   _refreshVoiceDropdown();
   _renderVoiceTestControls();
@@ -2082,6 +2103,10 @@ function _renderVoiceTestControls() {
   const model = provider?.models?.find(m => m.id === _voiceTestState.model);
   const controls = model?.tts_controls || { family: "openai" };
   _voiceTestState.controls = controls;
+  mountAccountVoicePicker($("vt-account-voices"), {
+    provider: provider?.name, enabled: controls.family === "elevenlabs", saved: provider?.api_key_set !== false,
+    input: $("vt-voice"),
+  });
   const host = $("vt-controls");
   host.innerHTML = voiceControlHtml(_voiceTestState.settings, controls, "vt");
   $("vt-emotion-control").innerHTML = voiceTestEmotionHtml(controls, _voiceTestState.emotion, _voiceTestState.settings.emotion_enabled);
@@ -2110,7 +2135,7 @@ export async function runVoiceTest() {
   button.disabled = true;
   const isCurrent = () => revision === _voiceTestState.revision && $("vt-result") === resultEl;
   if (resultEl) {
-    resultEl.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px"><div class="spinner"></div><div style="color:var(--text-3);font-size:13px">合成中…</div></div>`;
+    resultEl.innerHTML = `<div class="form-stack voice-test-loading"><div class="spinner"></div><div class="form-label-secondary">合成中…</div></div>`;
   }
 
   const settings = { ..._voiceTestState.settings, provider, model, voice: voice.trim() };
@@ -2124,7 +2149,7 @@ export async function runVoiceTest() {
     if (!isCurrent()) return;
     if (res.status >= 400) {
       if (resultEl) {
-        resultEl.innerHTML = `<div style="color:var(--danger);font-size:13px;padding:12px;border:1px solid var(--danger);border-radius:8px;word-break:break-all">${esc(res.data?.error || "调用失败")}</div>`;
+        resultEl.innerHTML = `<div class="voice-test-error" role="alert">${esc(res.data?.error || "调用失败")}</div>`;
       }
       return;
     }
@@ -2133,13 +2158,11 @@ export async function runVoiceTest() {
       const audio = document.createElement("audio");
       audio.src = `data:${mime_type || "audio/mpeg"};base64,${audio_b64 || ""}`;
       audio.controls = true;
-      audio.style.width = "100%";
-      audio.style.borderRadius = "8px";
       resultEl.replaceChildren(audio);
     }
   } catch (e) {
     if (isCurrent() && resultEl) {
-      resultEl.innerHTML = `<div style="color:var(--danger);font-size:13px;padding:12px;border:1px solid var(--danger);border-radius:8px;word-break:break-all">网络错误</div>`;
+      resultEl.innerHTML = `<div class="voice-test-error" role="alert">网络错误</div>`;
     }
   } finally {
     if (isCurrent()) button.disabled = false;
@@ -2148,7 +2171,7 @@ export async function runVoiceTest() {
 
 function renderSettingsChat() {
   setTopBar("对话设置", true,
-    `<button class="btn-text" onclick="PawzoChat.saveSettingsChat()" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.saveSettingsChat()">保存</button>`
   );
   const s = state.settings?.chat || {};
   const maxRounds = s.max_context_rounds || 20;
@@ -2188,7 +2211,7 @@ export async function saveSettingsChat() {
 
 function renderSettingsReply() {
   setTopBar("回复设置", true,
-    `<button class="btn-text" onclick="PawzoChat.saveSettingsReply()" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.saveSettingsReply()">保存</button>`
   );
   const s = state.settings?.reply || {};
   content().innerHTML = `<div class="page">
@@ -2314,15 +2337,14 @@ async function renderSettingsEmoji() {
 }
 
 export function emojiAddGroup() {
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">新建分组</div>
     <div style="margin:16px 0">
-      <input id="emoji-new-group" placeholder="输入分组名称"
-        style="width:100%;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+      <input class="form-input" id="emoji-new-group" placeholder="输入分组名称">
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.emojiConfirmAddGroup()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">创建</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.emojiConfirmAddGroup()">创建</button>
     </div>
   </div>`);
 }
@@ -2424,15 +2446,14 @@ async function renderEmojiGroup(data) {
 }
 
 export function emojiAddEmotion(groupName) {
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">新建情绪分类</div>
     <div style="margin:16px 0">
-      <input id="emoji-new-emotion" placeholder="输入情绪关键词，如 happy、sad"
-        style="width:100%;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+      <input class="form-input" id="emoji-new-emotion" placeholder="输入情绪关键词，如 happy、sad">
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.emojiConfirmAddEmotion(${_jsArg(groupName)})" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">创建</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.emojiConfirmAddEmotion(${_jsArg(groupName)})">创建</button>
     </div>
   </div>`);
 }
@@ -2453,15 +2474,14 @@ export async function emojiConfirmAddEmotion(groupName) {
 }
 
 export function emojiRenameGroup(oldName) {
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">重命名分组</div>
     <div style="margin:16px 0">
-      <input id="emoji-rename-group" value="${esc(oldName)}" placeholder="输入新名称"
-        style="width:100%;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+      <input class="form-input" id="emoji-rename-group" value="${esc(oldName)}" placeholder="输入新名称">
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.emojiConfirmRenameGroup(${_jsArg(oldName)})" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">保存</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.emojiConfirmRenameGroup(${_jsArg(oldName)})">保存</button>
     </div>
   </div>`);
 }
@@ -2582,19 +2602,19 @@ export function emojiUploadImages(group, emotion) {
 }
 
 export function emojiImageMenu(group, emotion, filename) {
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">${esc(filename)}</div>
     <div style="text-align:center;margin:16px 0">
       <img src="${window.PAWZOCHAT_BASE || ""}/emoji-static/${encodeURIComponent(group)}/${encodeURIComponent(emotion)}/${encodeURIComponent(filename)}"
         style="max-width:200px;max-height:200px;border-radius:8px">
     </div>
-    <div style="display:flex;flex-direction:column;gap:8px">
+    <div class="form-stack">
       <button onclick="PawzoChat.emojiRenameImage(${_jsArg(group)},${_jsArg(emotion)},${_jsArg(filename)})"
-        style="padding:12px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-1);font-size:15px;cursor:pointer;font-family:var(--font)">重命名</button>
+        class="btn-secondary">重命名</button>
       <button onclick="PawzoChat.emojiDeleteImage(${_jsArg(group)},${_jsArg(emotion)},${_jsArg(filename)})"
-        style="padding:12px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--error);font-size:15px;cursor:pointer;font-family:var(--font)">删除</button>
+        class="btn-secondary danger">删除</button>
       <button onclick="PawzoChat.closeOverlay()"
-        style="padding:12px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-3);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
+        class="btn-secondary">取消</button>
     </div>
   </div>`);
 }
@@ -2602,15 +2622,14 @@ export function emojiImageMenu(group, emotion, filename) {
 export function emojiRenameImage(group, emotion, oldFilename) {
   closeOverlay();
   setTimeout(() => {
-    showSheet(`<div style="padding:20px">
+    showSheet(`<div class="sheet-body">
       <div class="sheet-title">重命名图片</div>
       <div style="margin:16px 0">
-        <input id="emoji-rename-img" value="${esc(oldFilename)}" placeholder="输入新文件名"
-          style="width:100%;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+        <input class="form-input" id="emoji-rename-img" value="${esc(oldFilename)}" placeholder="输入新文件名">
       </div>
-      <div style="display:flex;gap:12px">
-        <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-        <button onclick="PawzoChat.emojiConfirmRenameImage(${_jsArg(group)},${_jsArg(emotion)},${_jsArg(oldFilename)})" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">保存</button>
+      <div class="form-actions">
+        <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+        <button class="btn-primary" onclick="PawzoChat.emojiConfirmRenameImage(${_jsArg(group)},${_jsArg(emotion)},${_jsArg(oldFilename)})">保存</button>
       </div>
     </div>`);
   }, 300);
@@ -2656,15 +2675,14 @@ export async function emojiDeleteImage(group, emotion, filename) {
 }
 
 export function emojiRenameEmotion(group, oldName) {
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div class="sheet-title">重命名情绪分类</div>
     <div style="margin:16px 0">
-      <input id="emoji-rename-emo" value="${esc(oldName)}" placeholder="输入新名称"
-        style="width:100%;border:1px solid var(--divider);border-radius:8px;padding:10px 12px;font-size:14px;font-family:var(--font);outline:none;background:var(--bg);color:var(--text-1)">
+      <input class="form-input" id="emoji-rename-emo" value="${esc(oldName)}" placeholder="输入新名称">
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.closeOverlay()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button onclick="PawzoChat.emojiConfirmRenameEmotion(${_jsArg(group)},${_jsArg(oldName)})" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">保存</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.closeOverlay()">取消</button>
+      <button class="btn-primary" onclick="PawzoChat.emojiConfirmRenameEmotion(${_jsArg(group)},${_jsArg(oldName)})">保存</button>
     </div>
   </div>`);
 }
@@ -2774,7 +2792,7 @@ function renderSettingsPassword() {
     return;
   }
   setTopBar("公网访问密码", true,
-    `<button class="btn-text" onclick="PawzoChat.savePassword()" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.savePassword()">保存</button>`
   );
   const hasPw = !!state.settings?.web?.has_password;
   content().innerHTML = `<div class="page">
@@ -2837,7 +2855,7 @@ function _showPublicWarning() {
   _publicWarningConfirmed = false;
   let countdown = 10;
 
-  showSheet(`<div style="padding:20px">
+  showSheet(`<div class="sheet-body">
     <div style="text-align:center;margin-bottom:4px">
       <div class="row-icon orange" style="width:48px;height:48px;border-radius:50%;font-size:24px">
         ${iconHtml("ri-error-warning-line")}
@@ -2853,9 +2871,9 @@ function _showPublicWarning() {
       </div>
       <p>但仍<strong style="color:var(--danger)">无法保证 100% 安全</strong>。自签名证书会被浏览器标记为"不受信任"，且服务暴露在公网可能面临未知安全威胁。请确保您充分理解并愿意自行承担相关风险。</p>
     </div>
-    <div style="display:flex;gap:12px">
-      <button onclick="PawzoChat.cancelPublicToggle()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--bg);color:var(--text-2);font-size:15px;cursor:pointer;font-family:var(--font)">取消</button>
-      <button id="public-confirm-btn" disabled onclick="PawzoChat.confirmPublicToggle()" style="flex:1;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--text-3);color:#fff;font-size:15px;cursor:not-allowed;font-family:var(--font)">我已了解风险 (${countdown}s)</button>
+    <div class="form-actions">
+      <button class="btn-secondary" onclick="PawzoChat.cancelPublicToggle()">取消</button>
+      <button class="btn-secondary" id="public-confirm-btn" disabled onclick="PawzoChat.confirmPublicToggle()">我已了解风险 (${countdown}s)</button>
     </div>
   </div>`, () => {
     if (_publicWarningTimer) { clearInterval(_publicWarningTimer); _publicWarningTimer = null; }
@@ -2875,8 +2893,8 @@ function _showPublicWarning() {
       _publicWarningTimer = null;
       btn.textContent = "我已了解风险";
       btn.disabled = false;
-      btn.style.background = "var(--danger)";
-      btn.style.cursor = "pointer";
+      btn.classList.replace("btn-secondary", "btn-primary");
+      btn.classList.add("danger");
     }
   }, 1000);
 }
@@ -3249,7 +3267,7 @@ export async function startUpdateDownload() {
     </div>
     <div id="update-progress-text" style="text-align:center;font-size:12px;color:var(--text-3);margin-top:8px">0%</div>
     <div id="update-done-actions" style="display:none;margin-top:16px">
-      <button onclick="PawzoChat.applyUpdate()" style="width:100%;padding:10px;border:none;border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:15px;cursor:pointer;font-family:var(--font)">立即重启更新</button>
+      <button class="btn-primary" onclick="PawzoChat.applyUpdate()">立即重启更新</button>
     </div>
     <button id="update-cancel-btn" class="btn-text" onclick="PawzoChat.closeOverlay()" style="margin-top:12px;width:100%">取消</button>
   </div>`, undefined, { dismissOverlay: false });
@@ -3353,7 +3371,7 @@ export async function applyUpdate() {
 
 async function renderProfileEdit() {
   setTopBar("个人资料", true,
-    `<button class="btn-text" onclick="PawzoChat.saveProfile()" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.saveProfile()">保存</button>`
   );
 
   const profile = state.profile || { name: "我", has_avatar: false };
@@ -3467,35 +3485,29 @@ async function renderSettingsTheme() {
   const selectedCount = sel.selected.size;
 
   // Top bar
-  const TOP_BTN_STYLE = "font-size:15px;font-weight:500;padding:8px 8px";
   if (sel.active) {
     const allOn = totalThemes > 0 && selectedCount === totalThemes;
     const exportDisabled = selectedCount === 0 ? " disabled" : "";
-    const exportStyle = selectedCount === 0 ? `${TOP_BTN_STYLE};opacity:0.3` : TOP_BTN_STYLE;
     const topBarRight = `
-      <button class="btn-text" onclick="PawzoChat.themeSelectionToggleAll()" style="${TOP_BTN_STYLE}">${allOn ? "取消全选" : "全选"}</button>
-      <button class="btn-text"${exportDisabled} onclick="PawzoChat.themeExportSelected()" style="${exportStyle}">导出</button>`;
-    const topBarLeft = `<button class="btn-text" onclick="PawzoChat.themeSelectionExit()" style="${TOP_BTN_STYLE}">取消</button>`;
+      <button class="btn-text" onclick="PawzoChat.themeSelectionToggleAll()">${allOn ? "取消全选" : "全选"}</button>
+      <button class="btn-text"${exportDisabled} onclick="PawzoChat.themeExportSelected()">导出</button>`;
+    const topBarLeft = `<button class="btn-text" onclick="PawzoChat.themeSelectionExit()">取消</button>`;
     setTopBar(`已选 ${selectedCount} 项`, false, topBarRight, topBarLeft);
   } else {
-    const selectStyle = totalThemes === 0 ? `${TOP_BTN_STYLE};opacity:0.3` : TOP_BTN_STYLE;
     const selectDisabled = totalThemes === 0 ? "disabled" : "";
     const topBarRight = `
-      <button class="btn-text" onclick="PawzoChat.themeImportPick()" style="${TOP_BTN_STYLE}">导入</button>
-      <button class="btn-text" ${selectDisabled} onclick="PawzoChat.themeSelectionEnter()" style="${selectStyle}">选择</button>`;
+      <button class="btn-text" onclick="PawzoChat.themeImportPick()">导入</button>
+      <button class="btn-text" ${selectDisabled} onclick="PawzoChat.themeSelectionEnter()">选择</button>`;
     setTopBar("主题", true, topBarRight);
   }
 
-  const modeRow = (key, label, desc) => {
+  const modeRow = (key, label) => {
     const meta = themeModeMeta[key] || themeModeMeta.light;
     return `
     <label class="card-row" style="cursor:pointer">
       <div class="row-icon ${meta.tone} theme-mode-icon">${iconHtml(meta.icon)}</div>
-      <div style="flex:1">
-        <div class="row-label">${label}</div>
-        <div style="font-size:12px;color:var(--text-3);margin-top:2px">${desc}</div>
-      </div>
-      <input type="radio" name="theme-mode" value="${key}" ${mode === key ? "checked" : ""} onchange="PawzoChat.onThemeModeChange('${key}')">
+      <span class="row-label">${label}</span>
+      <input type="radio" class="theme-mode-choice" name="theme-mode" value="${key}" ${mode === key ? "checked" : ""} onchange="PawzoChat.onThemeModeChange('${key}')">
     </label>`;
   };
   const activeThemes = activeNames.filter(n => byName.has(n));
@@ -3504,24 +3516,24 @@ async function renderSettingsTheme() {
 
   const checkboxFor = (name) => {
     const checked = sel.selected.has(name) ? "checked" : "";
-    return `<input type="checkbox" ${checked} onchange="PawzoChat.themeSelectionToggle(decodeURIComponent('${enc(name)}'))" style="width:20px;height:20px;cursor:pointer;margin:0 4px">`;
+    return `<input type="checkbox" ${checked} onchange="PawzoChat.themeSelectionToggle(decodeURIComponent('${enc(name)}'))">`;
   };
 
   const activeRow = (name, idx, total) => {
     const trailing = sel.active
       ? checkboxFor(name)
       : `
-      <button class="top-btn" title="上移" ${idx === 0 ? "disabled style=\"opacity:0.3\"" : ""} onclick="PawzoChat.onThemeMove(decodeURIComponent('${enc(name)}'), -1)">${iconHtml("ri-arrow-up-s-line")}</button>
-      <button class="top-btn" title="下移" ${idx === total - 1 ? "disabled style=\"opacity:0.3\"" : ""} onclick="PawzoChat.onThemeMove(decodeURIComponent('${enc(name)}'), 1)">${iconHtml("ri-arrow-down-s-line")}</button>
-      <button class="top-btn" title="移出应用" onclick="PawzoChat.onThemeToggle(decodeURIComponent('${enc(name)}'), false)">${iconHtml("ri-subtract-line")}</button>`;
+      <button type="button" class="icon-action" aria-label="上移" title="上移" ${idx === 0 ? "disabled" : ""} onclick="PawzoChat.onThemeMove(decodeURIComponent('${enc(name)}'), -1)">${iconHtml("ri-arrow-up-s-line")}</button>
+      <button type="button" class="icon-action" aria-label="下移" title="下移" ${idx === total - 1 ? "disabled" : ""} onclick="PawzoChat.onThemeMove(decodeURIComponent('${enc(name)}'), 1)">${iconHtml("ri-arrow-down-s-line")}</button>
+      <button type="button" class="icon-action" aria-label="移出应用" title="移出应用" onclick="PawzoChat.onThemeToggle(decodeURIComponent('${enc(name)}'), false)">${iconHtml("ri-subtract-line")}</button>`;
     return `
-    <div class="card-row">
+    <div class="card-row theme-row">
       <div class="row-icon purple">${iconHtml("ri-palette-line")}</div>
-      <div style="flex:1;min-width:0">
-        <div class="row-label" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(name)}</div>
-        <div style="font-size:12px;color:var(--text-3);margin-top:2px">第 ${idx + 1} 层${idx === total - 1 ? "（最上层，覆盖其他）" : ""}</div>
+      <div class="theme-row-copy">
+        <div class="row-label" title="${esc(name)}">${esc(name)}</div>
+        <div class="theme-layer">第 ${idx + 1} 层${idx === total - 1 ? " · 最上层" : ""}</div>
       </div>
-      ${trailing}
+      <div class="theme-actions">${trailing}</div>
     </div>`;
   };
 
@@ -3529,16 +3541,16 @@ async function renderSettingsTheme() {
     const trailing = sel.active
       ? checkboxFor(t.name)
       : `
-      <button class="top-btn" title="添加到应用" onclick="PawzoChat.onThemeToggle(decodeURIComponent('${enc(t.name)}'), true)">${iconHtml("ri-add-line")}</button>
-      <button class="top-btn" title="编辑" onclick="PawzoChat.pushPage('settingsThemeEdit',decodeURIComponent('${enc(t.name)}'))">${iconHtml("ri-edit-line")}</button>
-      <button class="top-btn" title="删除" onclick="PawzoChat.onThemeDelete(decodeURIComponent('${enc(t.name)}'))">${iconHtml("ri-delete-bin-line")}</button>`;
+      <button type="button" class="icon-action" aria-label="添加到应用" title="添加到应用" onclick="PawzoChat.onThemeToggle(decodeURIComponent('${enc(t.name)}'), true)">${iconHtml("ri-add-line")}</button>
+      <button type="button" class="icon-action" aria-label="编辑" title="编辑" onclick="PawzoChat.pushPage('settingsThemeEdit',decodeURIComponent('${enc(t.name)}'))">${iconHtml("ri-edit-line")}</button>
+      <button type="button" class="icon-action icon-action-danger" aria-label="删除" title="删除" onclick="PawzoChat.onThemeDelete(decodeURIComponent('${enc(t.name)}'))">${iconHtml("ri-delete-bin-line")}</button>`;
     return `
-    <div class="card-row">
+    <div class="card-row theme-row">
       <div class="row-icon neutral">${iconHtml("ri-palette-line")}</div>
-      <div style="flex:1;min-width:0">
-        <div class="row-label" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(t.name)}</div>
+      <div class="theme-row-copy">
+        <div class="row-label" title="${esc(t.name)}">${esc(t.name)}</div>
       </div>
-      ${trailing}
+      <div class="theme-actions">${trailing}</div>
     </div>`;
   };
 
@@ -3566,9 +3578,9 @@ async function renderSettingsTheme() {
   const modeCard = sel.active ? "" : `
     <div class="card">
       <div class="card-header">外观模式</div>
-      ${modeRow("light", "浅色", "始终使用浅色主题")}
-      ${modeRow("dark", "深色", "始终使用深色主题")}
-      ${modeRow("auto", "跟随系统", "跟随系统的浅色/深色偏好自动切换")}
+      ${modeRow("light", "浅色")}
+      ${modeRow("dark", "深色")}
+      ${modeRow("auto", "跟随系统")}
     </div>`;
 
   content().innerHTML = `${importInput}<div class="page">
@@ -3738,7 +3750,7 @@ async function renderSettingsThemeEdit(name) {
   const isNew = !name;
   _themeEditContext = { originalName: name || null, css: "" };
   setTopBar(isNew ? "新建主题" : "编辑主题", true,
-    `<button class="btn-text" onclick="PawzoChat.saveSettingsTheme()" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.saveSettingsTheme()">保存</button>`
   );
   if (isNew) {
     content().innerHTML = _renderThemeEditForm("", "");
@@ -3758,16 +3770,17 @@ async function renderSettingsThemeEdit(name) {
 function _renderThemeEditForm(name, css) {
   return `<div class="page">
     <div class="card">
-      <div class="form-group"><div class="form-row"><label>主题名称</label>
-        <input type="text" id="st-name" maxlength="50" placeholder="例如：粉色主题" value="${esc(name)}">
-      </div></div>
+      <div class="card-header"><label for="st-name">主题名称</label></div>
+      <div class="prompt-field">
+        <input type="text" class="form-input" id="st-name" maxlength="50" placeholder="例如：粉色主题" value="${esc(name)}">
+      </div>
     </div>
     <div class="card">
-      <div class="card-header">自定义 CSS</div>
-      <div class="form-group" style="padding:0 12px 12px">
-        <textarea id="st-css" rows="18" spellcheck="false" style="width:100%;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--text-1);line-height:1.5;resize:vertical" placeholder=":root { --primary: #E91E63; }">${esc(css)}</textarea>
+      <div class="card-header"><label for="st-css">自定义 CSS</label></div>
+      <div class="prompt-field">
+        <textarea class="prompt-input theme-css-input" id="st-css" rows="18" spellcheck="false" autocapitalize="off" autocorrect="off" aria-describedby="st-css-hint" placeholder=":root { --primary: #E91E63; }">${esc(css)}</textarea>
       </div>
-      <div class="form-hint" style="padding:0 16px 12px">支持任意 CSS。可通过覆盖 <code>:root</code> 中的 CSS 变量快速换色，也可以直接覆盖具体选择器。</div>
+      <div class="form-hint" id="st-css-hint">支持任意 CSS。可通过覆盖 <code>:root</code> 中的 CSS 变量快速换色，也可以直接覆盖具体选择器。</div>
     </div>
   </div>`;
 }

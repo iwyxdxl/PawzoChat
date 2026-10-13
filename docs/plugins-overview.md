@@ -8,7 +8,7 @@ PawzoChat 的 `plugins` 指的是**第三方后端运行时扩展机制**，不�
 
 当前这些能力属于核心功能，不通过插件实现：
 
-- 内建微信、QQ 与 Web 通道
+- 内建微信、QQ 与 Web 通道，以及 Web 多角色群聊
 - 对话队列与 LLM 主流程
 - 回复发送
 - 表情包管理与表情包发送
@@ -32,6 +32,14 @@ PawzoChat 的 `plugins` 指的是**第三方后端运行时扩展机制**，不�
 - 进阶：插件声明 `config_ui` 后，由插件自带的 HTML 在**沙箱 iframe** 内渲染，通过 `postMessage` 与宿主通信
 
 当前 `data/plugins/` 目录默认存在，仓库里**没有预置插件**。
+
+### 卸载插件
+
+在本机页面进入「设置 → 插件管理 → 插件详情」，点击底部的「卸载插件」，确认后即可移除，正常完成无需重启。URL 安装和手动安装的插件均支持此操作，公网访问时不显示卸载入口。
+
+卸载会永久删除该插件文件夹中的代码、配置和 `state/` 等数据，不提供保留选项；不会删除宿主聊天记录、账号配置或插件自行写到文件夹外的数据。若其他插件依赖它（包括已停用的插件），页面会列出名称，需先卸载这些依赖方。插件正在处理请求或无法安全停止时，文件不会被删除，请稍后重试或查看日志。
+
+接口为本机同源的 `DELETE /api/plugins/{plugin_id}`，无需请求体，成功返回 `{"ok": true}`；存在依赖返回 `409 plugin_in_use` 及 `dependents` 名称和 ID 列表。卸载与安装、更新共用事务恢复机制：提交前中断会恢复原目录，提交后不会恢复已卸载插件；临时清理失败由后台维护或下次启动重试。
 
 ---
 
@@ -63,7 +71,7 @@ data/plugins/reply_filter/
 - `plugin.py`：插件入口代码
 - `config.yaml`：插件启停状态和配置
 - `state/`：插件运行时持久化数据目录
-- `ui/`：可选目录。当 `plugin.yaml` 声明了 `config_ui` 后，宿主会通过 `GET /api/plugins/{plugin_id}/ui/<path>` 提供该目录下的静态文件给沙箱 iframe 加载
+- `ui/`：可选目录。当 `plugin.yaml` 声明了 `config_ui` 后，宿主会提供该目录下的静态文件给沙箱 iframe 加载；面板入口使用详情 API 的 `config_ui_url`
 
 插件目录为空时，系统仍可正常启动；插件管理器会自动确保 `data/plugins/` 存在。
 
@@ -78,11 +86,11 @@ data/plugins/reply_filter/
 3. 读取插件目录下的 `config.yaml`
 4. 如果 `config.yaml` 不存在，则按 `config_schema` 自动生成默认配置，默认 `enabled: false`
 5. 使用 Kahn 拓扑排序建立依赖顺序；无法排入拓扑序的插件（循环依赖或依赖了处于循环中的插件）会在加载阶段被依赖检查自然拦截，不影响其余插件
-6. 加载 `entrypoint` 指向的 Python 工厂函数
+6. 检查清单及已保存的平台限制；当前系统支持时才加载 `entrypoint` 指向的 Python 工厂函数
 7. 调用 `create_plugin()`，获得 `Plugin` 实例
 8. 调用 `plugin.setup(ctx)` 注入上下文；插件在 `setup()` 中自行注册 hook、工具或聊天通道
 
-如果 `setup()` 半途抛错，宿主会清掉已注册的 hook、工具和通道，但不会调用这个尚未完成加载的实例的 `teardown()`；插件需自行回滚在 `setup()` 中已启动的外部资源。
+如果 `setup()` 半途抛错，宿主会尝试调用已创建实例的 `teardown()`，清掉已注册的 hook、工具、通道及插件目录下的模块。`teardown()` 必须容忍初始化尚未完成，并可靠停止插件自己启动的线程或连接；清理失败会阻止在线替换。
 
 卸载或刷新时：
 
@@ -109,9 +117,12 @@ data/plugins/reply_filter/
 | `author` | 否 | 作者（会展示在前端管理界面） |
 | `hooks` | 否 | 声明会用到的 hook 列表，仅用于展示；实际注册以 `setup()` 调用为准 |
 | `depends_on` | 否 | 依赖的其他插件 `id` |
+| `platforms` | 否 | 适用系统的非空、不重复数组，仅 `windows`、`macos`、`linux`；省略表示不限 |
 | `permissions` | 否 | 申请使用的受控能力；当前识别 5 种权限，其他值仅展示用于审计（见 §6） |
 | `config_schema` | 否 | 用于默认值填充、基本校验和前端配置表单自动渲染 |
 | `config_ui` | 否 | 启用自定义 HTML 配置面板，详见 §5.1 |
+
+例如 Windows 专用插件可填 `platforms: [windows]`，同时支持 Windows 和 macOS 则填 `platforms: [windows, macos]`。不能填 `null`、空数组、重复项或未知系统名。平台按 **PawzoChat 后端服务所在系统** 判断，与浏览器所在系统无关，不区分 CPU 架构。不匹配时不执行插件入口，也不允许启用；手动复制的插件同样受限。
 
 示例：
 
@@ -190,7 +201,7 @@ settings:
 
 后端只校验上面列出的类型、必填项与数组元素；`enum`、`minimum`、`maximum` 等是前端控件提示，不会由后端再次约束。Schema 未声明的额外 `settings` 字段目前也会被保留。
 
-`secret: true` 仅改变前端输入框外观，不会加密存储；对应值仍明文保存在插件 `config.yaml`，并可由仅限本地的插件详情 API 和自定义配置面板读取。
+`secret: true` 仅改变前端输入框外观，不会加密存储；对应值仍明文保存在插件 `config.yaml`，并可由本地或已登录公网的插件详情 API 和自定义配置面板读取。
 
 示例：
 
@@ -226,7 +237,7 @@ config_schema:
 如果 `config_schema` 自动渲染的表单不能满足需求（例如需要分组、向导、即时预览、自定义控件），可以在 `plugin.yaml` 中声明 `config_ui` 字段，由插件提供 HTML 文件渲染配置面板：
 
 ```yaml
-config_ui: true               # 简写：等价于 entry: index.html, height: auto
+config_ui: true               # 简写：入口为 ui/index.html，高度随内容变化
 ```
 
 或显式形式：
@@ -234,17 +245,21 @@ config_ui: true               # 简写：等价于 entry: index.html, height: au
 ```yaml
 config_ui:
   entry: index.html           # 相对 ui/ 目录；旧写法 ui/index.html 会被兼容归一化
-  height: auto                # 或固定像素值，如 480
 ```
+
+面板高度由页面内容决定，宿主不设固定最小或最大高度。服务端在插件 HTML 中注入自动高度桥，内容增减、图片或字体加载、窄屏换行时都会重新测量，插件无需手动上报高度。旧插件的 `config_ui.height` 字段仍可保留，但不会再固定面板高度。
+
+面板应采用自然文档流，让内容撑开页面；避免用 `100vh`、百分比 `height` / `min-height` 等依赖 iframe 视口高度的布局，以免与自动高度相互影响。
 
 **渲染机制：**
 
-- 宿主在插件详情页插入 `<iframe sandbox="allow-scripts">`，源地址为 `/api/plugins/{plugin_id}/ui/{entry}`
-- iframe 的源是 **null**（沙箱属性不带 `allow-same-origin`）：拿不到 cookie、localStorage、父窗口 DOM、也无法 fetch 宿主 `/api/*`
+- 宿主在插件详情页插入 `<iframe sandbox="allow-scripts">`，直接使用详情 API 返回的 `config_ui_url` 作为源地址
+- iframe 的源是 **null**（沙箱属性不带 `allow-same-origin`）：拿不到宿主 cookie、localStorage、父窗口 DOM，也不能直接读取宿主管理 API
 - 宿主与 iframe 通过 `window.postMessage` 通信，宿主以 `event.source === iframe.contentWindow` 识别消息来源
 - 声明 `config_ui` 后，宿主**不再渲染 `config_schema` 表单**和默认的“保存配置”按钮——保存动作完全由 iframe 内部触发
 - `config_schema` 仍用于默认值和已声明字段的类型校验；它不会拒绝未声明的额外字段
-- 静态资源路由 `GET /api/plugins/{plugin_id}/ui/<path>` 仅限本地访问，且只对声明了 `config_ui` 的插件开放，路径会做防越目录校验
+- 静态资源只对声明了 `config_ui` 的插件开放，并校验目录穿越和符号链接逃逸；响应设置 `X-Frame-Options: SAMEORIGIN` 与 `Content-Security-Policy: frame-ancestors 'self'`
+- 本地使用普通 `/ui/` 地址，公网使用带路径前缀的签名 `/ui-assets/{token}/` 地址，让沙箱内不携带登录 Cookie 的相对 JS/CSS、图片请求也能加载。资源令牌仅允许读取对应插件的 UI 文件，24 小时后或应用重启时失效，退出登录不会立即撤销
 
 **postMessage 协议：**
 
@@ -254,7 +269,8 @@ iframe → 宿主：
 | --- | --- | --- |
 | `ready` | — | iframe 加载完成，请求初始数据 |
 | `save` | `id`, `settings` | 请求保存（宿主调 `PATCH /api/plugins/{id}/config`） |
-| `resize` | `height` | 当 `height: auto` 时，告知宿主调整 iframe 高度 |
+| `pawzo:config-resize` | `height` | 由宿主注入的自动高度桥发送，插件无需自行发送 |
+| `resize` | `height` | 旧面板兼容消息；仅在自动高度桥尚未就绪时接受 |
 | `toast` | `level`, `message` | 弹出宿主级 toast（`success` / `error` / `info`） |
 
 宿主 → iframe：
@@ -290,13 +306,13 @@ iframe → 宿主：
 
 `ctx.llm`（包括显式 provider 调用、按 persona 绑定调用和 provider 枚举）当前**不**受权限门控，插件作者无需声明权限即可进入这些接口。需要注意：截至本文核对版本，`chat_as_persona()` 和 `get_persona_binding()` 会对 `Persona` 数据类误用 `.get()` 而抛 `AttributeError`；修复前可使用 `list_providers()` 配合显式的 `chat()`。
 
-**安全模型说明**：插件本身已运行在主进程内，权限检查不是安全沙箱，而是“能力可见性”——它把插件声明了什么暴露给用户审计，并对宿主提供的受控 facade 做进入许可。前端插件详情页会展示该插件声明的全部权限，用户可在启用前查看。
+**安全模型说明**：插件本身已运行在主进程内，权限检查不是安全沙箱，而是“能力可见性”——它把插件声明了什么暴露给用户审计，并对宿主提供的受控 facade 做进入许可。前端插件详情的“高级信息”保留该插件声明的权限供需要的用户查看。
 
 ---
 
 ## 7. Hook（hook）列表
 
-当前正式支持 6 个 hook：
+当前正式支持 6 个 hook，作用于私聊消息链路。Web 多角色群聊使用独立调度，不触发这些 hook；群聊仍可按角色工具配置调用插件发布的 LLM 工具。`ctx.conversations` 与 `ctx.messaging` 目前只面向角色私聊，不提供群历史读取或群消息推送接口。
 
 | hook | 时机 | 可修改 | 可取消 | 典型用途 |
 | --- | --- | --- | --- | --- |
@@ -341,14 +357,16 @@ iframe → 宿主：
 
 在设置页中点击「插件管理」即可进入插件管理界面：
 
-- **插件列表页**：显示所有已安装插件的名称、描述、版本、状态和启停开关
-- **插件详情页**：显示 manifest 信息、启停开关、重载按钮，配置区域根据是否声明 `config_ui` 渲染为自动表单或沙箱 iframe；若插件声明了 `permissions`，会在元信息行展示权限列表供用户审计
+- **插件列表页**：显示所有已安装插件的名称、描述、版本和状态，条目右侧显示箭头，点击进入插件详情配置页，启停开关仅在详情页提供；右上角提供刷新，顶部小卡片在本地模式下提供检查更新和添加插件，添加插件浮窗包含从链接安装和手动安装说明
+- **插件详情页**：显示 manifest 信息、启停开关和重载按钮；本地模式下，来源信息以小字显示在顶部作者信息下方，在线安装的插件在重载按钮下方提供检查更新，有新版本时显示更新按钮，不再单独占用“版本与来源”板块。配置区域根据是否声明 `config_ui` 渲染为自动表单或沙箱 iframe；技术元数据与权限列表位于默认折叠的“高级信息”
 
 列表页顶部始终显示风险警告：安装第三方插件等同于在本机执行不受限的代码，请确认插件来源可信后再启用。PawzoChat 不对第三方插件的安全性负责，使用风险自负。
 
 ### 访问控制
 
-插件管理 API **整体仅限本地访问**，公网请求对所有端点（含自定义 UI 静态资源）均返回 403。前端设置页在公网模式下不显示插件管理入口。
+本地和公网设置页均提供插件管理入口。公网登录后可查看、修改配置、启停、重载和重新扫描插件，写请求须通过同源检查。普通 `/ui/` 资源路由在公网仍要求登录；签名资源路由仅凭有效令牌即可执行只读 `GET/HEAD`，不授予配置读取或管理权限。
+
+URL 预览、安装、在线检查更新、升级及其任务查询只允许本地访问；安装相关写请求还会校验完整本地 Origin（协议、主机、实际监听端口）。公网登录不会获得这些权限。
 
 ### REST API
 
@@ -361,9 +379,19 @@ iframe → 宿主：
 | POST | `/api/plugins/{plugin_id}/disable` | 停用插件 |
 | POST | `/api/plugins/{plugin_id}/reload` | 重载插件 |
 | PATCH | `/api/plugins/{plugin_id}/config` | 更新插件配置 |
-| GET | `/api/plugins/{plugin_id}/ui/{path}` | 仅当声明 `config_ui` 时可用，提供 `ui/` 目录下的静态资源给沙箱 iframe |
+| GET/HEAD | `/api/plugins/{plugin_id}/ui/{path}` | 读取已声明 `config_ui` 的插件静态资源，公网要求登录 |
+| GET/HEAD | `/api/plugins/{plugin_id}/ui-assets/{token}/{path}` | 使用对应插件的有效签名令牌读取静态资源，无效或过期令牌返回 401 |
+| POST | `/api/plugins/install/preview` | 本地提交 `{url}`，202 返回预览 task_id |
+| GET | `/api/plugins/tasks/{task_id}` | 本地查询下载、预览及提交结果 |
+| POST | `/api/plugins/install` | 本地提交 `{task_id}` 确认安装 |
+| POST | `/api/plugins/install/cancel` | 本地取消尚未提交的预览 |
+| GET | `/api/plugins/updates` | 本地批量检查更新；`?force=1` 绕过缓存 |
+| GET | `/api/plugins/{plugin_id}/updates` | 本地检查单个插件 |
+| POST | `/api/plugins/{plugin_id}/upgrade` | 本地提交预览 task_id；换公钥时需 trust_token |
 
-当前上述 refresh、enable、disable、reload 和配置 PATCH 最终都会执行一次**全量刷新**，使全部插件经历卸载和重新加载；`/{plugin_id}/reload` 目前不是隔离的单插件热重载。
+详情及 enable、disable、reload、配置 PATCH 返回的 `plugin` 详情包含 `config_ui_url`：无自定义面板时为 `null`，本地为普通 UI 入口，公网为包含公网路径前缀的签名入口。调用方应直接使用该地址；宿主进入详情页时绕过详情缓存，重新获取链接。
+
+当前上述 refresh、enable、disable、reload 和配置 PATCH 最终都会执行一次**全量刷新**，使全部插件经历卸载和重新加载；`/{plugin_id}/reload` 目前不是隔离的单插件热重载。已有 hook、工具或通道调用未结束时，管理操作可能返回 409 `plugin_busy`，待调用结束后再尝试；清理失败则阻止继续替换。
 
 ---
 
@@ -373,20 +401,20 @@ iframe → 宿主：
 
 - 仅支持进程内 Python 运行时插件，不支持独立进程沙箱
 - 插件可以通过 `config_ui` 在沙箱 iframe 内渲染自定义配置面板，但不能向宿主主页面注入 JS/CSS，也不能直接修改主界面布局
-- 不支持在线安装市场或远程安装
+- 支持本地面板通过 JSON 索引 URL 安装；不提供官方插件市场，不允许公网面板下载安装
 - 不支持 `pip entry points`
 - 不暴露完整 `App` 对象
 - `plugin_id` 必须为小写字母、数字、下划线和连字符，以字母或数字开头
 - 多个目录声明相同 `plugin_id` 时，仅加载目录名排序在前的那个，后续重复的将被跳过
 - 循环依赖不会导致所有插件崩溃；环上的插件及其下游依赖者会各自得到准确的错误信息（"Dependencies not active"），不影响无关插件
-- 插件管理 API 整体仅限本地访问；加载错误的 `last_error` 可能包含入口文件等本地绝对路径，不应把本地 API 响应转发给不受信任方
+- 插件详情中的配置和加载错误会向本地及已登录的公网用户开放；`last_error` 可能包含入口文件等本地绝对路径
 
 正常开发入口是受控 `PluginContext`，而不是完整 `App` 对象；这减少了对内部实现的耦合，但不构成强制隔离。
 
 **安全提示**：
 
 - 插件 Python 代码运行在主进程内，拥有完整的 Python 运行时权限。`PluginContext` 的 facade 与 `permissions` 提供的是 API 清晰度和可审计性，不是安全沙箱。安装插件等同于执行不受限的第三方代码
-- 自定义 HTML 面板加载在 `sandbox="allow-scripts"`（无 `allow-same-origin`）的 iframe 内，源为 null：拿不到 cookie、localStorage、父窗口、宿主 `/api/*`，与宿主只能通过 `postMessage` 通信。这是浏览器层面的隔离，不是插件 Python 代码的隔离
+- 自定义 HTML 面板加载在 `sandbox="allow-scripts"`（无 `allow-same-origin`）的 iframe 内，源为 null：拿不到宿主 cookie、localStorage、父窗口 DOM，也不能直接读取宿主管理 API，与宿主通过 `postMessage` 通信。这是浏览器层面的隔离，不是插件 Python 代码的隔离
 
 ---
 
@@ -415,3 +443,101 @@ iframe → 宿主：
 - 核心数据存储
 
 判断标准：如果这是产品必备主链路，放核心；如果这是可选扩展点，放插件。
+
+---
+
+## 12. URL 安装、发布与更新
+
+点击本地插件页的「添加插件」，在浮窗中粘贴作者提供的安装链接（技术格式为 **JSON 索引 URL**），获取插件后查看名称、版本、来源和更新内容，再确认安装。浮窗也提供手动安装说明：将插件文件夹放入 `data/plugins/`，然后回到插件页点击右上角刷新。签名及安装包校验由后台自动完成，普通界面不展示公钥或校验参数。不能直接粘贴 zip URL。预览只下载和解析，不执行插件代码；确认新装后插件保持停用，配置有效后可手动启用。预览就绪后保留 30 分钟，重启使未提交预览失效。
+
+在线来源保存于宿主管理的 `.install.json`。启动后检查一次，以后每 24 小时检查；普通结果缓存 1 小时，手动检查绕过缓存。自动检查不下载或安装新版。手动复制的插件显示本地来源，也可通过同 ID、更高版本的索引包升级为在线管理。
+
+安装成功后自动收起进度浮窗并清理临时下载文件，无需手动移除记录。后台保留精简的任务结果及已完成事务记录约 24 小时，用于重复请求和结果查询，随后自动清理。失败时显示原因并可重新获取插件；程序自动保留插件文件、设置、数据及必要的更新来源和事务记录。更新成功并通过加载检查后，旧版快照自动删除，不提供手动恢复旧版本。
+
+插件不支持当前系统时会自动阻止安装或启用，并简短提示原因。请使用作者提供的对应系统版本。
+
+### JSON 索引字段
+
+| 字段 | 类型 | 必填 | 约定 |
+|---|---|---|---|
+| pawzochat_plugin_index | integer | 是 | 当前必须为整数 1，不接受布尔值；用于识别插件索引和格式版本 |
+| id | string | 是 | 与包内 manifest.id 一致，`[a-z0-9][a-z0-9_-]*`，最多 128 字符 |
+| version | string | 是 | 与 manifest.version 完全一致的 SemVer，例如 `1.2.0` |
+| download_url | string | 是 | http/https zip 直链 |
+| sha256 | string | 是 | zip 实际内容的 64 位十六进制 SHA-256 |
+| name | string | 否 | 展示名称 |
+| description | string | 否 | 简介 |
+| author | string | 否 | 作者 |
+| min_app_version | string | 否 | 最低宿主 SemVer；不需要限制时省略字段 |
+| platforms | string[] | 否 | 非空且不重复，仅 windows/macos/linux；省略表示不限系统 |
+| changelog | string | 否 | 本版更新说明 |
+| public_key | string | 否 | Ed25519 原始 32 字节公钥的 base64 |
+| signature | string | 否 | 64 字节 Ed25519 签名的 base64，必须与 public_key 同时出现 |
+
+格式标记不是安全认证；未来索引格式升级时递增，旧宿主会明确拒绝不支持的格式。版本按 SemVer 比较，例如 `1.10.0 > 1.9.0`、`1.0.0-rc.1 < 1.0.0`。不接受 `v1.2.0` 或仅写 `1.2`。`min_app_version` 不满足时仍可查看预览，但服务端禁止安装或升级到该包。
+
+索引和 `plugin.yaml` 均可填写 `platforms`，当前系统须同时满足两处限制，建议保持一致。索引不匹配时不下载 zip；清单不匹配时在提取后拒绝，提交前还会复验。索引限制由宿主保存，之后启动和启用仍会检查。若各系统使用不同包，请分别提供索引和下载地址；`platforms` 不承担自动选包。缺省不影响旧插件；面向不识别该字段的旧宿主发布时，应同时填写所需的 `min_app_version`。
+
+例如，打包好 `reply_filter-1.2.0.zip` 后，用下面脚本生成带真实哈希的完整索引。替换下载域名为实际发布地址，并保证包内 id/version 相同：
+
+```python
+import hashlib, json
+from pathlib import Path
+
+archive = Path("reply_filter-1.2.0.zip")
+index = {
+    "pawzochat_plugin_index": 1,
+    "id": "reply_filter",
+    "version": "1.2.0",
+    "download_url": "https://example.com/plugins/reply_filter-1.2.0.zip",
+    "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+    "name": "Reply Filter",
+    "description": "过滤发送前的回复",
+    "author": "Alice",
+    "min_app_version": "0.2.2",
+    "platforms": ["windows", "macos"],  # 示例：只支持这两个系统；不限则省略
+    "changelog": "修复过滤规则",
+}
+Path("reply_filter.json").write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+```
+
+索引放在稳定 URL，后续发布更新其版本、直链及哈希；zip 建议使用版本专属 URL。不要给未改变版本号的包替换内容。
+
+### 打包和校验
+
+`plugin.yaml` 必须在 zip 根目录，或唯一顶层目录中；不能包含多个候选插件根。禁止绝对路径、越界路径、符号链接和规范化后重名文件。不要发布 `config.yaml`、`.install.json`、运行时 `state/` 或 Python 字节码，宿主会重新生成/保留这些内容。URL 新装要求配置 schema 的默认值通过校验；必填配置项应有可用默认值，否则先通过手动本地安装完成配置。
+
+macOS/Linux 包中需要执行的脚本或程序应在打包前设置可执行权限，宿主会保留其可执行位，不恢复特殊权限。
+
+三个平台的哈希命令分别为：
+
+```sh
+# macOS
+shasum -a 256 reply_filter-1.2.0.zip
+# Linux
+sha256sum reply_filter-1.2.0.zip
+```
+
+```powershell
+# Windows PowerShell
+(Get-FileHash .\reply_filter-1.2.0.zip -Algorithm SHA256).Hash.ToLower()
+```
+
+索引固定上限 1 MB。默认包上限 500 MB、解压上限 2048 MB、下载总期限 600 秒；大模型/音色资源可按需修改主配置并重启：
+
+```yaml
+plugins:
+  max_download_mb: 500
+  max_unzipped_mb: 2048
+  download_timeout_seconds: 600
+```
+
+两个大小限制允许 0 表示不限，超时必须为正数；成员数量及压缩比保护仍有效。精简发行包可减少下载时间和更新期间的磁盘占用。打包版没有 pip，插件依赖应使用宿主已有库或随包携带兼容的纯 Python 代码。
+
+### 签名、升级与自动恢复
+
+签名可选。签名载荷以 `download_url/id/min_app_version/pawzochat_plugin_index/sha256/version` 六字段为基础；存在 `platforms` 时额外纳入原始数组，不改写数组顺序，缺省时保持旧六字段签名兼容。使用规范 JSON：按键排序、无空白、`ensure_ascii=True`，未提供 min_app_version 时使用空字符串。平台声明的添加、删除或修改需重新签名。公钥首次随索引下发不独立证明作者身份；高级用户可通过作者的可信渠道核对。普通界面不显示公钥，后续换公钥或撤销签名时仅简短提醒来源变化，要求针对本次更新再次确认。
+
+升级保留 config/settings、启用状态与 state，停用插件升级后仍停用。新版加载失败时自动恢复提交前完整快照；恢复无法完成则保留现场并阻止继续加载。成功后不保留旧版代码，后续发现的问题需要作者发布更高版本修复。文件恢复不能撤销发送消息等外部副作用。`teardown()` 必须停止自管线程、定时器和写入操作。
+
+可复制的打包签名脚本、GitHub Actions 发布工作流及升级数据约定见[开发指南第 18 节](plugin-development-guide.md#18-发布索引与自动更新)。

@@ -1,12 +1,16 @@
 import { esc, escAttr } from "./utils.js";
 
 // Shared by the live conversation and history editor.
-export function renderQuoteBox(quote, media = [], localId = "", personaId = "") {
+export function renderQuoteBox(quote, media = [], localId = "", personaId = "", groupId = "") {
   if (!quote && !media.length) return "";
   const base = window.PAWZOCHAT_BASE || "";
   const attachments = media.map((block, i) => {
     if (block.expired || !localId) return '<div class="quote-expired">引用附件已失效</div>';
-    const url = `${base}/api/conversations/${encodeURIComponent(personaId)}/quote-media/${encodeURIComponent(localId)}/${i}`;
+    const filename = (block.path || '').split(/[\\/]/).pop();
+    const kind = block.type === 'voice' ? 'voice' : block.type === 'file' ? 'files' : 'images';
+    const url = groupId
+      ? block.url ? (/^https?:/i.test(block.url) ? block.url : base + block.url) : `${base}/api/groups/${encodeURIComponent(groupId)}/media/${kind}/${encodeURIComponent(filename || '')}`
+      : `${base}/api/conversations/${encodeURIComponent(personaId)}/quote-media/${encodeURIComponent(localId)}/${i}`;
     if (block.type === "image" || block.type === "emoji") {
       return `<img class="quote-image" src="${escAttr(url)}" loading="lazy" alt="引用图片" onclick="PawzoChat.openImagePreview(this.src)">`;
     }

@@ -25,6 +25,7 @@ import re
 from flask import Blueprint, jsonify, request
 
 from pawzochat.voice.base import VoiceGenerationError
+from pawzochat.voice.providers.elevenlabs_tts import ElevenLabsTTSProvider
 from pawzochat.voice.settings import (
     VOICE_GENERATION_DEFAULTS, control_family, control_description,
     normalize_voice_generation, validate_voice_generation,
@@ -38,6 +39,7 @@ from pawzochat.voice.manager import (
     VOICE_PROVIDER_PRESETS,
     ensure_voice_models_list,
     resolve_model_type,
+    resolve_base_url,
     resolve_voice_catalog,
 )
 from pawzochat.web.routes import get_app
@@ -140,6 +142,10 @@ def _normalize_models_payload(models, provider_cfg) -> tuple[list[dict], str | N
         if t and t not in VALID_MODEL_TYPES:
             return [], f"模型「{mid}」的调用方式不支持: {t}"
         entry["type"] = t or resolve_model_type(provider_cfg, m)
+        if provider_cfg.get("preset") == "elevenlabs" and entry["type"] != "elevenlabs_tts":
+            return [], "ElevenLabs 服务商须使用 ElevenLabs 原生调用方式"
+        if entry["type"] == "elevenlabs_tts" and mid != ElevenLabsTTSProvider.MODEL:
+            return [], "ElevenLabs 首版仅支持 eleven_v4"
         # Optional per-model voice preset
         if "voice" in m:
             entry["voice"] = m["voice"]
@@ -209,13 +215,11 @@ def update_voice_provider(name: str):
         else:
             entry["api_key"] = providers[name].get("api_key", "")
 
-        if "models" in data:
-            models, merr = _normalize_models_payload(data["models"], entry)
-            if merr:
-                return jsonify({"error": merr}), 400
-            entry["models"] = models
-        else:
-            entry["models"] = ensure_voice_models_list(providers[name])
+        raw_models = data["models"] if "models" in data else ensure_voice_models_list(providers[name])
+        models, merr = _normalize_models_payload(raw_models, entry)
+        if merr:
+            return jsonify({"error": merr}), 400
+        entry["models"] = models
 
         if new_name != name:
             del providers[name]
@@ -238,6 +242,33 @@ def delete_voice_provider(name: str):
         app.config.save()
         _reinit_voice(app)
     return jsonify({"ok": True})
+
+
+@api_voice_providers_bp.route("/<name>/voices", methods=["GET"])
+def list_account_voices(name: str):
+    cfg = get_app().config.get("voice_providers", default={}).get(name)
+    if cfg is None:
+        return jsonify({"error": "语音服务商未找到"}), 404
+    if cfg.get("preset") != "elevenlabs" and not any(
+        resolve_model_type(cfg, model) == "elevenlabs_tts" for model in (cfg.get("models") or [])
+    ):
+        return jsonify({"error": "该服务商不支持账户音色查询"}), 400
+    try:
+        page_size = int(request.args.get("page_size", "30"))
+        if not 1 <= page_size <= 100:
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "page_size 必须为 1–100 的整数"}), 400
+    provider = ElevenLabsTTSProvider(resolve_base_url(cfg), cfg.get("api_key", ""))
+    try:
+        result = provider.list_voices(search=request.args.get("search", ""),
+                                      next_page_token=request.args.get("next_page_token", ""),
+                                      page_size=page_size)
+    except VoiceGenerationError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code or 502
+    response = jsonify(result)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # ---- Model CRUD under a voice provider ---------------------------------
@@ -273,7 +304,10 @@ def add_voice_model(name: str):
         if "voice" in data:
             new_entry["voice"] = data["voice"]
 
-        models.append(new_entry)
+        validated, error = _normalize_models_payload([new_entry], provider_cfg)
+        if error:
+            return jsonify({"error": error}), 400
+        models.append(validated[0])
         app.config.save()
         _reinit_voice(app)
     return jsonify({"ok": True}), 201
@@ -295,14 +329,11 @@ def update_voice_model(name: str, model_id: str):
         if target is None:
             return jsonify({"error": "模型未找到"}), 404
 
-        if "name" in data:
-            target["name"] = data["name"]
-        if "type" in data:
-            if data["type"] not in VALID_MODEL_TYPES:
-                return jsonify({"error": f"不支持的调用方式: {data['type']}"}), 400
-            target["type"] = data["type"]
-        if "voice" in data:
-            target["voice"] = data["voice"]
+        updated = {**target, **{key: data[key] for key in ("name", "type", "voice") if key in data}}
+        validated, error = _normalize_models_payload([updated], providers[name])
+        if error:
+            return jsonify({"error": error}), 400
+        target.update(validated[0])
 
         app.config.save()
         _reinit_voice(app)

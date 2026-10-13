@@ -21,15 +21,13 @@ from __future__ import annotations
 import logging
 import random
 import time
+import threading
 
 from pawzochat.transport.client import ILinkClient
 from pawzochat.transport.models import TypingStatus
 from pawzochat.transport.lifecycle import ConnectionInactive
 
 logger = logging.getLogger(__name__)
-
-SEND_IMAGE_MAX_RETRIES = 3
-SEND_FILE_MAX_RETRIES = 3
 
 
 class MessageSender:
@@ -38,7 +36,8 @@ class MessageSender:
     def __init__(self, client: ILinkClient, reply_config: dict | None = None):
         self.client = client
         self._reply_config = dict(reply_config or {})
-        self._typing_tickets: dict[str, str] = {}
+        self._typing_tickets: dict[str, dict] = {}
+        self._typing_lock = threading.Lock()
 
     @staticmethod
     def _record_receipt(callback, response):
@@ -63,78 +62,38 @@ class MessageSender:
         """Upload an image to CDN and send it as a WeChat image message."""
         from pawzochat.transport.cdn import upload_image
 
-        for attempt in range(1, SEND_IMAGE_MAX_RETRIES + 1):
-            try:
-                cdn_info = upload_image(self.client, image_path, to_user_id)
-                msg = ILinkClient.build_image_message(to_user_id, cdn_info, context_token)
-                response = self.client.send_message(msg)
-                self._record_receipt(on_sent, response)
-                logger.info("图片发送成功: to=%s file=%s", to_user_id, image_path)
-                return True
-            except ConnectionInactive:
-                return False
-            except Exception:
-                if attempt < SEND_IMAGE_MAX_RETRIES:
-                    logger.warning(
-                        "图片发送失败 (attempt %d/%d): to=%s",
-                        attempt, SEND_IMAGE_MAX_RETRIES, to_user_id,
-                        exc_info=True,
-                    )
-                else:
-                    logger.exception(
-                        "图片发送失败 (已重试 %d 次): to=%s",
-                        SEND_IMAGE_MAX_RETRIES, to_user_id,
-                    )
-        return False
+        try:
+            cdn_info = upload_image(self.client, image_path, to_user_id)
+            msg = ILinkClient.build_image_message(to_user_id, cdn_info, context_token)
+            response = self.client.send_message(msg)
+            self._record_receipt(on_sent, response)
+            return True
+        except ConnectionInactive:
+            return False
+        except Exception as exc:
+            logger.warning("图片发送失败（不自动重发）: %s", type(exc).__name__)
+            return False
 
     def send_file(
-        self,
-        to_user_id: str,
-        file_path: str,
-        context_token: str,
-        file_name: str = "",
-        *, on_sent=None,
+        self, to_user_id: str, file_path: str, context_token: str,
+        file_name: str = "", *, on_sent=None,
     ) -> bool:
-        """Upload a non-image file to CDN and send it as a WeChat file message."""
+        """Upload once (CDN owns retries), then submit the message once."""
         from pawzochat.transport.cdn import upload_file
 
-        for attempt in range(1, SEND_FILE_MAX_RETRIES + 1):
-            try:
-                cdn_info = upload_file(
-                    self.client,
-                    file_path,
-                    to_user_id,
-                    file_name=file_name,
-                )
-                msg = ILinkClient.build_file_message(
-                    to_user_id,
-                    cdn_info,
-                    context_token,
-                    file_name=file_name,
-                )
-                response = self.client.send_message(msg)
-                self._record_receipt(on_sent, response)
-                logger.info(
-                    "文件发送成功: to=%s file=%s",
-                    to_user_id,
-                    file_name or file_path,
-                )
-                return True
-            except ConnectionInactive:
-                return False
-            except Exception:
-                if attempt < SEND_FILE_MAX_RETRIES:
-                    logger.warning(
-                        "文件发送失败 (attempt %d/%d): to=%s",
-                        attempt, SEND_FILE_MAX_RETRIES, to_user_id,
-                        exc_info=True,
-                    )
-                else:
-                    logger.exception(
-                        "文件发送失败 (已重试 %d 次): to=%s",
-                        SEND_FILE_MAX_RETRIES, to_user_id,
-                    )
-        return False
+        try:
+            cdn_info = upload_file(self.client, file_path, to_user_id, file_name=file_name)
+            msg = ILinkClient.build_file_message(
+                to_user_id, cdn_info, context_token, file_name=file_name,
+            )
+            response = self.client.send_message(msg)
+            self._record_receipt(on_sent, response)
+            return True
+        except ConnectionInactive:
+            return False
+        except Exception as exc:
+            logger.warning("文件发送失败（不自动重发）: %s", type(exc).__name__)
+            return False
 
     def send_one_reply(
         self,
@@ -200,15 +159,29 @@ class MessageSender:
             logger.debug("发送 typing 状态失败", exc_info=True)
 
     def _get_typing_ticket(self, ilink_user_id: str, context_token: str) -> str:
-        cached = self._typing_tickets.get(ilink_user_id)
-        if cached:
-            return cached
-        try:
-            resp = self.client.get_config(ilink_user_id, context_token)
-            ticket = resp.get("typing_ticket", "")
-            if ticket:
-                self._typing_tickets[ilink_user_id] = ticket
-            return ticket
-        except Exception:
-            logger.debug("获取 typing_ticket 失败", exc_info=True)
-            return ""
+        # One sender belongs to one connection/account; restarts replace it.
+        # Serialize refreshes so concurrent sends cannot fetch the same ticket twice.
+        with self._typing_lock:
+            now = time.monotonic()
+            entry = self._typing_tickets.get(ilink_user_id)
+            if entry and now < entry["next_fetch_at"]:
+                return entry["ticket"]
+            try:
+                resp = self.client.get_config(ilink_user_id, context_token)
+                if resp.get("ret") in (0, "0"):
+                    ticket = resp.get("typing_ticket") or ""
+                    if not isinstance(ticket, str):
+                        raise ValueError("invalid typing ticket")
+                    self._typing_tickets[ilink_user_id] = {
+                        "ticket": ticket, "next_fetch_at": now + random.random() * 86400,
+                        "retry_delay": 2,
+                    }
+                    return ticket
+            except Exception as exc:
+                logger.debug("获取 typing_ticket 失败: %s", type(exc).__name__)
+            delay = min(entry["retry_delay"] * 2, 3600) if entry else 2
+            self._typing_tickets[ilink_user_id] = {
+                "ticket": entry["ticket"] if entry else "",
+                "next_fetch_at": now + delay, "retry_delay": delay,
+            }
+            return self._typing_tickets[ilink_user_id]["ticket"]

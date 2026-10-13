@@ -16,11 +16,10 @@
 
 """Built-in capability tools: ``record_memory`` / ``update_memory``.
 
-Let the chat LLM decide when a conversation moment is worth remembering,
-instead of the old fixed-round auto-summarization. Both tools write through
-:class:`pawzochat.services.memory.MemoryService`, so the on-disk format
-(``data/chats/<persona_id>/memory.json``) is identical to memories created
-manually in the web panel.
+Let the chat LLM decide when a conversation moment is worth remembering.
+Private writes use :class:`pawzochat.services.memory.MemoryService` and the
+same format as the web editor. Group writes are staged in the current member's
+group scope and saved only after their full reply is sent.
 
 ``update_memory`` targets a memory by its storage index — the same ``#N``
 numbers that :meth:`MemoryService.format_memories_for_prompt` annotates in
@@ -149,10 +148,29 @@ def make_handlers(app: App) -> tuple[
 
     def _check_context(context: dict) -> tuple[str, list[ContentBlock] | None]:
         """Shared persona/enabled/service guards; returns (persona_id, error)."""
+        if context.get("memory_mode") == "read_only":
+            return "", _err("群聊只能读取长期记忆，不能新增或修改。")
         persona = context.get("persona")
         persona_id = context.get("persona_id") or ""
         if persona is None or not persona_id:
             return "", _err("记忆工具上下文缺失：未提供 persona。")
+        if context.get("conversation_type") == "group":
+            service = getattr(app, "group_memory_service", None)
+            memory_context = context.get("memory_context")
+            group_id = context.get("group_id")
+            if (service is None or context.get("memory_mode") != "group"
+                    or not isinstance(memory_context, dict)
+                    or memory_context.get("group_id") != group_id
+                    or memory_context.get("persona_id") != persona_id
+                    or not isinstance(memory_context.get("fingerprints"), dict)):
+                return "", _err("缺少本轮群记忆快照，无法写入，请正常回复。")
+            cancelled = context.get("is_cancelled")
+            if memory_context.get("blocked") or (callable(cancelled) and cancelled()):
+                return "", _err("本轮记忆写入已停止，请正常回复。")
+            settings = service.get_settings(group_id, persona_id)
+            if not settings["enabled"] or settings["trigger_mode"] == "summarize_only":
+                return "", _err("本群当前不允许 AI 自主记录记忆，请正常回复。")
+            return persona_id, None
         # Runtime re-check as a safety measure (mirrors the image generation
         # tool pattern — the persona snapshot may have drifted since tool-list
         # construction).
@@ -200,10 +218,15 @@ def make_handlers(app: App) -> tuple[
             return error
 
         try:
-            entry, index = app.memory_service.add_memory(
-                persona_id, summary, arguments.get("importance", 3),
-                tool_context=context["memory_context"],
-            )
+            if context.get("conversation_type") == "group":
+                entry, index = app.group_memory_service.stage_add_memory(
+                    context["memory_context"], summary, arguments.get("importance", 3),
+                )
+            else:
+                entry, index = app.memory_service.add_memory(
+                    persona_id, summary, arguments.get("importance", 3),
+                    tool_context=context["memory_context"],
+                )
         except DuplicateMemoryError:
             logger.info("跳过重复工具记忆 persona=%s", persona_id)
             return _err("已有相同内容的记忆，无需重复记录。请继续正常回复。")
@@ -213,10 +236,12 @@ def make_handlers(app: App) -> tuple[
             "工具记录记忆 persona=%s index=%d importance=%d",
             persona_id, index, entry["importance"],
         )
+        status = (f"记忆 #{index} 已暂存，将在本次群发言全部发送完成后保存"
+                  if context.get("conversation_type") == "group" else f"已记录记忆 #{index}")
         return [ContentBlock(
             type="text",
             text=(
-                f"已记录记忆 #{index}（重要度{entry['importance']}）。"
+                f"{status}（重要度{entry['importance']}）。"
                 "请继续自然地回复用户，不要在回复中提及记忆操作。"
             ),
         )]
@@ -245,19 +270,27 @@ def make_handlers(app: App) -> tuple[
 
         memory_context = context["memory_context"]
         try:
-            changed = app.memory_service.update_memory(
-                persona_id, index, updates,
-                expected_fingerprint=memory_context["fingerprints"].get(index, ""),
-                tool_context=memory_context,
-            )
+            if context.get("conversation_type") == "group":
+                changed = app.group_memory_service.stage_update_memory(
+                    memory_context, index, updates,
+                    expected_fingerprint=memory_context["fingerprints"].get(index, ""),
+                )
+            else:
+                changed = app.memory_service.update_memory(
+                    persona_id, index, updates,
+                    expected_fingerprint=memory_context["fingerprints"].get(index, ""),
+                    tool_context=memory_context,
+                )
         except (MemoryConflictError, DuplicateMemoryError) as exc:
             return _conflict(context, persona_id, "update", exc)
         if not changed:
             return _err(f"记忆 #{index} 未变化，无需重复更新。请继续正常回复。")
         logger.info("工具更新记忆 persona=%s index=%d", persona_id, index)
+        status = (f"记忆 #{index} 的更新已暂存，将在本次群发言全部发送完成后保存"
+                  if context.get("conversation_type") == "group" else f"已更新记忆 #{index}")
         return [ContentBlock(
             type="text",
-            text=f"已更新记忆 #{index}。请继续自然地回复用户，不要在回复中提及记忆操作。",
+            text=f"{status}。请继续自然地聊天，不要在回复中提及记忆操作。",
         )]
 
     return record_handler, update_handler

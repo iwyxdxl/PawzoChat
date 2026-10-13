@@ -132,6 +132,20 @@ class HookDispatcher:
         }
         self._lock = threading.Lock()
         self._on_error = on_error
+        self._paused: set[str] = set()
+        self._active: dict[str, int] = {}
+
+    def pause_plugin(self, plugin_id: str) -> bool:
+        """Block new calls, or reject without changes if a call is in flight."""
+        with self._lock:
+            if self._active.get(plugin_id, 0):
+                return False
+            self._paused.add(plugin_id)
+            return True
+
+    def resume_plugin(self, plugin_id: str) -> None:
+        with self._lock:
+            self._paused.discard(plugin_id)
 
     def register(
         self,
@@ -159,6 +173,13 @@ class HookDispatcher:
             handlers = list(self._handlers.get(hook_name, ()))
 
         for _priority, plugin_id, handler in handlers:
+            with self._lock:
+                # A dispatch snapshot may predate unregister/reload. Never
+                # invoke a handler removed while an earlier handler ran.
+                entry = (_priority, plugin_id, handler)
+                if plugin_id in self._paused or entry not in self._handlers.get(hook_name, ()):
+                    continue
+                self._active[plugin_id] = self._active.get(plugin_id, 0) + 1
             try:
                 handler(event)
             except Exception as exc:
@@ -169,6 +190,13 @@ class HookDispatcher:
                 )
                 if self._on_error:
                     self._on_error(plugin_id, hook_name, exc)
+            finally:
+                with self._lock:
+                    remaining = self._active[plugin_id] - 1
+                    if remaining:
+                        self._active[plugin_id] = remaining
+                    else:
+                        self._active.pop(plugin_id, None)
 
     def dispatch_message_received(self, event: MessageReceivedEvent) -> None:
         self.dispatch(HOOK_MESSAGE_RECEIVED, event)

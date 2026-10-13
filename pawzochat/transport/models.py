@@ -300,15 +300,6 @@ class Persona:
         return "\n\n".join(parts)
 
 
-@dataclass
-class Binding:
-    peer_user_id: str = ""
-    persona_id: str = ""
-    display_name: str = ""
-    context_token: str = ""
-    first_seen: str = ""
-
-
 # ---------------------------------------------------------------------------
 # API response helpers
 # ---------------------------------------------------------------------------

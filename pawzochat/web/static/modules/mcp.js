@@ -151,7 +151,7 @@ async function renderMcpOverview() {
 async function renderMcpServerDetail(data) {
   const name = data.name;
   const editBtn = _isPublic ? "" :
-    `<button class="btn-text" onclick="PawzoChat.pushPage('mcpServerEdit',{name:'${esc(name)}',isNew:false})" style="font-size:15px;font-weight:500">编辑</button>`;
+    `<button class="btn-text" onclick="PawzoChat.pushPage('mcpServerEdit',{name:'${esc(name)}',isNew:false})">编辑</button>`;
   setTopBar(name, true, editBtn);
   content().innerHTML = `<div class="loading-center"><div class="spinner"></div></div>`;
 
@@ -251,7 +251,7 @@ async function renderMcpServerEdit(data) {
   }
 
   setTopBar("编辑 MCP Server", true,
-    `<button class="btn-text" onclick="PawzoChat.mcpSaveServer(false,'${esc(oldName)}')" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.mcpSaveServer(false,'${esc(oldName)}')">保存</button>`
   );
   _renderFormMode(false, oldName);
 }
@@ -282,7 +282,7 @@ async function _renderFormMode(isNew, oldName) {
   const showUrl = isHttp || isSse;
 
   const topRightBtn = isNew
-    ? `<button class="btn-text" onclick="PawzoChat.mcpSaveServer(true,'')" style="font-size:15px;font-weight:500">保存</button>`
+    ? `<button class="btn-text" onclick="PawzoChat.mcpSaveServer(true,'')">保存</button>`
     : "";
   if (isNew) {
     setTopBar("添加 MCP Server", true, topRightBtn);
@@ -408,7 +408,7 @@ async function renderMcpAdapterEdit(data) {
   const isNew = data.isNew;
   const oldName = data.name || "";
   setTopBar(isNew ? "添加适配器" : "编辑适配器", true,
-    `<button class="btn-text" onclick="PawzoChat.mcpSaveAdapter(${isNew},'${esc(oldName)}')" style="font-size:15px;font-weight:500">保存</button>`
+    `<button class="btn-text" onclick="PawzoChat.mcpSaveAdapter(${isNew},'${esc(oldName)}')">保存</button>`
   );
 
   let adapter = { description: "", mcp_server: "", mcp_tool: "", parameters: {}, param_mapping: {}, inject_fields: {} };

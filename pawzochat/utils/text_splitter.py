@@ -115,14 +115,15 @@ def parse_voice_reply(text: str, *, split_newline: bool = True) -> list[ReplySeg
     return segments
 
 
-def strip_voice_markers(text: str) -> str:
+def strip_voice_markers(text: str, *, preserve_boundaries: bool = False) -> str:
     """Strip [语音]/[voice] markers themselves, keeping the content after them.
 
     For text-only flows such as Moments: they have no voice pipeline, so if
     the model leaks a marker, only the marker is removed and the content is
-    published as regular text.
+    published as regular text. preserve_boundaries separates adjacent text
+    for group mention matching.
     """
-    return _VOICE_MARKER_RE.sub("", text) if text else text
+    return _VOICE_MARKER_RE.sub(" " if preserve_boundaries else "", text) if text else text
 
 
 def contains_voice_marker(text: str) -> bool:

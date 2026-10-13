@@ -31,7 +31,8 @@ import { applyThemeFromState, watchSystemTheme } from "./modules/theme.js";
 
 import {
   chatPersonaId, renderChatList, refreshChatMessages,
-  filterConvs, newConversation, startChat, openChat,
+  openGroupChat, handleGroupEvent, stopGroupChat, mentionGroupMember,
+  filterConvs, newConversation, selectChatPersona, startChat, openChat,
   chatMore, clearChat, deleteChat,
   linkWechat, doLinkWechat, unlinkWechat, viewPersonaFromChat, viewMemoryFromChat,
   openHistoryEdit,
@@ -41,9 +42,11 @@ import {
   showTypingIndicator, appendAssistantMessage,
   toggleEmojiPicker, switchEmojiTab, insertEmoji, sendSticker,
   togglePlusMenu,
-  quoteMessage, clearPendingQuote,
+  quoteMessage, copyMessage, clearPendingQuote,
   playVoiceMessage, toggleVoiceTranscript,
 } from "./modules/chat.js";
+
+import { openCreateGroupDialog, openGroupSettings, saveGroupSettings } from "./modules/groups.js";
 
 import {
   heDateChange,
@@ -136,6 +139,12 @@ import {
 } from "./modules/plugins.js";
 
 import {
+  pluginShowInstall, pluginSourceInput, pluginStartPreview, pluginOpenTask, pluginCancelTask, pluginConfirmTask,
+  pluginCheckUpdates, pluginPreviewUpgrade,
+  onPluginTaskProgress, onPluginUpdatesAvailable, pluginReconnect,
+} from "./modules/plugin_install.js";
+
+import {
   showQuickSetup, submitQuickSetup, skipQuickSetup,
   checkAndShowSetup,
   qsProviderChange, qsAvatarSelected,
@@ -220,10 +229,16 @@ registerPageRenderer("discoverPlaceholder", renderPlaceholder);
 function initSSE() {
   if (state.sseSource) state.sseSource.close();
   state.sseSource = new EventSource((window.PAWZOCHAT_BASE || "") + "/api/events");
-  state.sseSource.onopen = () => refreshChatMessages();
+  state.sseSource.onopen = () => {
+    pluginReconnect();
+    api.invalidate(k => k.startsWith('/api/groups') || k.startsWith('/api/conversations'));
+    refreshChatMessages();
+    if (state.currentTab === 'chat' && (isDesktop() || state.pageStack.length === 0)) renderChatList();
+  };
   state.sseSource.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
+      if (data.type?.startsWith("group_")) { handleGroupEvent(data); return; }
       if (data.type === "channel_upload") {
         if (data.error) toast(`${data.name || "附件"}：${data.error}`, "error");
         else if (data.total) toast(`${data.name || "附件"} 上传 ${Math.round(data.uploaded * 100 / data.total)}%`);
@@ -252,6 +267,8 @@ function initSSE() {
           renderChatList();
         }
       }
+      if (data.type === "plugin_task_progress") onPluginTaskProgress(data);
+      if (data.type === "plugin_updates_available") onPluginUpdatesAvailable(data);
       if (data.type === "update_progress") {
         onUpdateProgress(data);
       }
@@ -275,7 +292,8 @@ window.PawzoChat = {
   switchTab, goBack, pushPage,
   closeOverlay, closeConfirm, overlayClick,
   openImagePreview, closeImagePreview,
-  newConversation, startChat, openChat,
+  newConversation, selectChatPersona, startChat, openChat,
+  openGroupChat, openCreateGroupDialog, openGroupSettings, saveGroupSettings, stopGroupChat, mentionGroupMember,
   filterConvs, chatMore, clearChat, deleteChat,
   linkWechat, doLinkWechat, unlinkWechat, viewPersonaFromChat, viewMemoryFromChat,
   openHistoryEdit,
@@ -289,7 +307,7 @@ window.PawzoChat = {
   pickFile, onFileSelected, removePendingFile,
   toggleEmojiPicker, switchEmojiTab, insertEmoji, sendSticker,
   togglePlusMenu,
-  quoteMessage, clearPendingQuote,
+  quoteMessage, copyMessage, clearPendingQuote,
   playVoiceMessage, toggleVoiceTranscript,
   filterPersonas, chatWithPersona, deletePersona,
   savePersona, switchPersonaEditTab, resetSystemInstructions, onPersonaProviderChange,
@@ -356,6 +374,8 @@ window.PawzoChat = {
   mcpSwitchEditMode, mcpParseJson, mcpImportJson,
   mcpSaveUrl, mcpUrlAutoName,
   pluginToggle, pluginSaveConfig, pluginReload, pluginRefresh,
+  pluginShowInstall, pluginSourceInput, pluginStartPreview, pluginOpenTask, pluginCancelTask, pluginConfirmTask,
+  pluginCheckUpdates, pluginPreviewUpgrade,
   showQuickSetup, submitQuickSetup, skipQuickSetup,
   qsProviderChange, qsAvatarSelected,
   qsSelectAccount, qsStartScan,

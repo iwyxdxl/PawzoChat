@@ -10,12 +10,7 @@ data/emoji/*
 !data/mcp_servers/**
 data/mcp_servers/*/server
 data/mcp_servers/*/server.exe
-data/plugins/*/state/
-data/plugins/*/state/**
-data/plugins/*/cache/
-data/plugins/*/cache/**
-data/plugins/*/logs/
-data/plugins/*/logs/**
+data/plugins/*
 key/
 tests/
 test/

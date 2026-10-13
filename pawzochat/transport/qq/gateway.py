@@ -78,7 +78,7 @@ class QQGateway:
 
     @property
     def running(self) -> bool:
-        return self._connected
+        return self._connected and not self._stopped.is_set()
 
     # ---- Lifecycle ----
 
@@ -118,6 +118,8 @@ class QQGateway:
                 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
                 continue
 
+            if self._stopped.is_set():
+                break
             self._ws = websocket.WebSocketApp(
                 gateway_url,
                 on_open=self._on_open,
@@ -125,6 +127,8 @@ class QQGateway:
                 on_error=self._on_error,
                 on_close=self._on_close,
             )
+            if self._stopped.is_set():
+                break
             try:
                 # WS-level ping/pong so a half-open socket is detected and
                 # closed (falling through to the reconnect path below) instead
@@ -154,7 +158,11 @@ class QQGateway:
 
     # ---- WebSocketApp callbacks ----
 
-    def _on_open(self, _ws) -> None:
+    def _on_open(self, ws) -> None:
+        # stop() can race the socket handshake; close it as soon as it opens.
+        if self._stopped.is_set():
+            ws.close()
+            return
         logger.debug("[QQ %s] websocket 已连接，等待 Hello", self.label)
 
     def _on_error(self, _ws, error) -> None:
@@ -199,10 +207,15 @@ class QQGateway:
             self.client.invalidate_access_token()
 
     def _on_message(self, ws, raw: str) -> None:
+        if self._stopped.is_set():
+            return
         try:
             packet = json.loads(raw)
         except (ValueError, TypeError):
-            logger.debug("[QQ %s] 收到非 JSON 帧: %r", self.label, raw[:120])
+            logger.debug("[QQ %s] 收到非 JSON 帧", self.label)
+            return
+
+        if not isinstance(packet, dict):
             return
 
         op = packet.get("op")
@@ -217,10 +230,13 @@ class QQGateway:
             logger.info("[QQ %s] 服务端要求重连", self.label)
             self._close_socket()
         elif op == OP_INVALID_SESSION:
-            # Resume rejected — drop the session so we re-identify fresh.
-            logger.info("[QQ %s] 会话失效，将重新鉴权", self.label)
-            self._session_id = ""
-            self._last_seq = None
+            can_resume = packet.get("d") is True
+            logger.info("[QQ %s] 会话失效，3 秒后重连 (can_resume=%s)", self.label, can_resume)
+            if not can_resume:
+                self._session_id = ""
+                self._last_seq = None
+                self.client.invalidate_access_token()
+            self._next_reconnect_delay = 3
             self._close_socket()
 
     # ---- Protocol steps ----

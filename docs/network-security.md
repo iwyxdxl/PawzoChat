@@ -55,6 +55,7 @@ is_public = request.environ.get("pawzochat.is_public", False)
   ├─ 公网端点已锁定 → 403（此时不再检查路径前缀）
   ├─ 路径前缀不匹配 → 404
   ├─ /login、/static/style.css、/static/logo.png → 免登录
+  ├─ 插件签名静态资源 GET/HEAD → 验证资源令牌后只读放行
   ├─ session.authenticated=true → 放行
   ├─ /api/* → 401 JSON
   └─ 其他页面 → 重定向 /login
@@ -79,7 +80,7 @@ is_public = request.environ.get("pawzochat.is_public", False)
 $pbkdf2-sha256$600000$<salt_hex>$<hash_hex>
 ```
 
-启动时会把旧版明文密码自动迁移为上述哈希格式。
+登录只接受上述哈希格式的存储值，不兼容明文密码。未公开开发测试阶段遗留的明文配置可通过本地面板重设密码。
 
 公网连续 5 次密码错误后，`SecretPrefixMiddleware` 会锁定整个公网端点，后续请求统一返回 403。一次成功登录会把失败计数清零；锁定后只能重启程序解锁。该计数是整个公网实例共享的，不是按 IP 分组的限流器。
 
@@ -99,7 +100,7 @@ $pbkdf2-sha256$600000$<salt_hex>$<hash_hex>
 - `Referrer-Policy: same-origin`
 - 公网响应额外带 `Content-Security-Policy: frame-ancestors 'none'`
 
-本地插件配置 iframe 的静态资源路由会单独把 `X-Frame-Options` 改为 `SAMEORIGIN`，以允许宿主页面嵌入沙箱 iframe。
+插件配置 iframe 的静态资源响应使用 `X-Frame-Options: SAMEORIGIN` 和 `Content-Security-Policy: frame-ancestors 'self'`，允许本地或公网的同源宿主页面嵌入沙箱 iframe。
 
 ## 公网功能限制
 
@@ -108,11 +109,28 @@ $pbkdf2-sha256$600000$<salt_hex>$<hash_hex>
 - `GET /api/settings` 不返回 `web` 段，不暴露端口、路径和密码状态。
 - `PATCH /api/settings` 禁止修改 `web` 段。
 - `POST /api/settings/regenerate-public` 禁止重新生成公网端口和路径。
-- `/api/plugins/*` 全部仅限本地访问，公网返回 403。
 - `/api/update/check|state|download|apply` 仅限本地访问，公网返回 404。
-- 前端在公网模式下隐藏网络设置和插件管理入口。
+- 插件 URL 预览、安装、取消预览、在线检查更新、升级及任务查询仅限本地，已登录公网访问返回 403。
+- 插件安装进度和更新通知 SSE 仅发送给本地连接，公网插件响应也不提供下载管理元数据。
+- 前端在公网模式下隐藏网络设置入口及插件安装、在线更新操作。
 
-其他已认证 API 仍可能修改角色、会话、服务商等数据；公网密码泄露应按完整面板权限泄露处理。
+公网登录后可管理已安装插件，包括查看、修改配置、启停、重载和重新扫描；写请求仍需通过同源检查。插件详情中的配置值（包括标记为 `secret` 的字段）可由已登录用户读取，加载错误的 `last_error` 也可能包含本地文件路径。其他已认证 API 还可修改角色、会话、服务商等数据；公网密码泄露应按完整面板权限泄露处理。
+
+## 本地插件安装请求
+
+本地面板仍免密码登录，但插件安装相关写接口额外检查同源：`/api/plugins/install/preview`、`/api/plugins/install`、`/api/plugins/install/cancel` 和 `/api/plugins/{id}/upgrade` 的请求目标必须是实际本地监听端口上的 `http://127.0.0.1` 或 `http://localhost`，且 `Origin` 必须与目标的协议、主机和端口全部相同。仅在没有 `Origin` 时回退检查 `Referer`；缺失或不匹配返回 403。两种本地主机名不能混用。此限制也适用于脚本调用。
+
+安装确认前只下载和解析候选包，不执行候选插件代码；新装插件默认停用。安装包哈希及可选签名用于完整性和后续来源连续性校验，首次索引自带公钥不独立证明作者身份。插件启用后运行在宿主 Python 进程内，不具备代码沙箱。完整流程见[插件概览](plugins-overview.md#12-url-安装发布与更新)。
+
+## 插件配置面板与资源链接
+
+自定义插件面板继续使用 `sandbox="allow-scripts"`，不授予 `allow-same-origin`。面板通过 `postMessage` 接收初始配置、请求宿主保存配置，不能直接取得宿主页面身份。
+
+插件详情及返回 `plugin` 详情的操作响应包含 `config_ui_url`：未声明自定义面板时为 `null`，本地使用 `/api/plugins/{id}/ui/{entry}`，公网使用包含路径前缀的 `/api/plugins/{id}/ui-assets/{token}/{entry}`。前端直接使用该地址，并在进入详情时重新获取，避免复用过期链接。
+
+公网沙箱内的 JS/CSS 等资源请求可能不携带登录 Cookie，因此签名资源路由支持凭令牌进行 `GET/HEAD` 读取。令牌绑定单个插件，有效期 24 小时；仅可读取已声明 `config_ui` 的插件 `ui/` 目录内文件，不能读取配置或调用管理 API。相对资源路径会保留令牌路径，目录穿越和符号链接逃逸均被拒绝。普通 `/ui/` 路由在公网仍要求登录。
+
+资源令牌使用独立签名用途和当前应用密钥，无效或过期令牌返回 401。应用重启会使令牌失效；退出登录不会撤销已签发的资源链接，它们持续有效至到期或重启。
 
 ## 证书、凭据与部署边界
 
@@ -158,8 +176,9 @@ web:
 
 相关实现：
 
-- `pawzochat/app.py`：双 Server 启动与明文密码迁移
+- `pawzochat/app.py`：双 Server 启动
 - `pawzochat/web/app.py`：路径前缀、认证、同源检查和安全响应头
+- `pawzochat/web/routes/api_plugins.py`：插件管理与配置面板静态资源
 - `pawzochat/web/routes/api_settings.py`：密码规则与公网设置限制
 - `pawzochat/utils/crypto.py`：密码哈希与校验
 - `pawzochat/utils/certs.py`：自签名证书生成
