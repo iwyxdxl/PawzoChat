@@ -51,7 +51,7 @@ PawzoChat 是一个功能强大的 AI 对话平台，基于大语言模型（LLM
 ### 扩展能力
 - **MCP 工具** — 支持 Model Context Protocol，可接入联网搜索、图像识别等外部工具
 - **插件系统** — 运行时发现和加载第三方插件，支持注册通道、注册工具、复用 LLM、发送消息
-- **多模型支持** — OpenAI 兼容、Anthropic、Gemini 三种后端，预设 PawAPI / DeepSeek / SiliconFlow 等常用中转
+- **多模型支持** — OpenAI Chat Completions 兼容、OpenAI Responses、Anthropic、Gemini 四种后端，预设 PawAPI / DeepSeek / SiliconFlow 等常用中转
 
 ### Web 管理面板
 - **对话管理** — 查看/搜索历史对话、编辑消息、清除对话、多会话切换

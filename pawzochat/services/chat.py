@@ -27,16 +27,18 @@ import base64
 import copy
 import logging
 import random
-import secrets
+import hashlib
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pawzochat.core.config import DEFAULT_GROUP_SYSTEM_INSTRUCTIONS
 from pawzochat.image.providers.novelai_image import is_novelai_v4_model
 from pawzochat.image.reference import resolve_reference_images
-from pawzochat.llm.base import ContentBlock, LLMResponse, ToolCall
+from pawzochat.llm.base import ContentBlock, LLMResponse, ToolCall, ToolExecutionResult
+from pawzochat.llm.converter import content_blocks_to_text
 from pawzochat.services.mcp_image_extractor import extract_mcp_images
 from pawzochat.utils.group_mentions import annotate_reply_mentions
 from pawzochat.utils.message_text import (
@@ -151,7 +153,6 @@ class ChatService:
             self.config.get("chat", "max_context_rounds", default=20)
         )
         history = self.store.get_recent_rounds(persona_id, max_rounds)
-        images, files = self._context_media(history, images, files)
         persona = self._resolve_persona(persona_id)
 
         capabilities = self.llm_manager.get_model_capabilities(
@@ -197,11 +198,12 @@ class ChatService:
                 persona_id=persona_id,
                 persona=persona,
                 messages=llm_messages,
-                images=list(images or []),
+                images=self._context_images(history, images),
             )
             self.extension_manager.dispatch_context_build(context_event)
             llm_messages = context_event.messages
 
+        tool_history: list[dict] = []
         response = self._run_tool_loop(
             persona=persona,
             persona_id=persona_id,
@@ -211,15 +213,19 @@ class ChatService:
             pending_files=pending_files,
             generated_images=generated_images,
             memory_context=memory_context,
+            tool_history=tool_history,
         )
 
         # Count the completed round after any tool writes were acknowledged.
         if self.memory_service:
             self.memory_service.on_round_complete(persona_id)
 
+        if tool_history and history:
+            tool_history[0]["_context_message_id"] = history[-1].get("local_id", "")
         return self._response_drafts(
             persona_id, response, generated_images, voice_settings,
             voice_triggered=voice_triggered,
+            tool_history=tool_history,
         )
 
     def generate_group_reply(
@@ -411,7 +417,6 @@ class ChatService:
                 {"type": "text", "text": f"[{speaker_label}]"},
                 *message.get("content", []),
             ]
-        images, files = self._context_media(group_history)
         # The matcher sees the latest real group utterance, including a peer's
         # message, instead of searching the speaker-relative user/assistant roles.
         latest_turn = history[-1].get("turn_id") if history else None
@@ -425,7 +430,7 @@ class ChatService:
             if block.get("type") in {"text", "voice"}
         )
         llm_messages = self._build_llm_messages(
-            persona, persona_id, group_history, images, files, capabilities,
+            persona, persona_id, group_history, None, None, capabilities,
             extra_hint=("请根据完整群聊记录，继续发出你自己的下一次群聊回复。"
                         if not group_history or group_history[-1]["role"] == "assistant" else None),
             active_tool_names=active_tool_names,
@@ -438,12 +443,14 @@ class ChatService:
             memory_context=memory_context,
             memory_prompt_override=memory_prompt,
         )
+        tool_history: list[dict] = []
         response = self._run_tool_loop(
             persona=persona, persona_id=persona_id, llm_messages=llm_messages,
             tools=tools, pending_images=pending_images, pending_files=pending_files,
             generated_images=generated_images,
             memory_context=memory_context,
             group_scope=scope,
+            tool_history=tool_history,
         )
         if is_cancelled():
             return []
@@ -452,6 +459,7 @@ class ChatService:
             voice_triggered=voice_triggered,
             group_scope=scope, group_member_names=member_names,
             group_user_name=profile_name,
+            tool_history=tool_history,
         )
 
     def _response_drafts(
@@ -465,6 +473,7 @@ class ChatService:
         group_scope: _GroupGenerationScope | None = None,
         group_member_names: dict[str, str] | None = None,
         group_user_name: str = "我",
+        tool_history: list[dict] | None = None,
     ) -> list[dict]:
         """Share reply splitting and voice degradation across chat modes.
 
@@ -572,6 +581,8 @@ class ChatService:
 
         if group_scope and group_scope.is_cancelled():
             return []
+        if tool_history:
+            assistant_messages[0]["tool_history"] = tool_history
         return assistant_messages
 
     def run_oneshot(
@@ -736,6 +747,7 @@ class ChatService:
         generated_images: list[dict],
         memory_context: dict | None = None,
         group_scope: _GroupGenerationScope | None = None,
+        tool_history: list[dict] | None = None,
     ) -> LLMResponse | None:
         """Run the provider.chat / tool-call loop. Returns the terminal response.
 
@@ -762,6 +774,9 @@ class ChatService:
         response: LLMResponse | None = None
         loop_completed = False
         allowed_tool_names = {tool.get("name", "") for tool in (tools or [])}
+        capabilities = self.llm_manager.get_model_capabilities(
+            persona.llm_provider, persona.llm_model,
+        )
         for _ in range(max_iter):
             if group_scope and group_scope.is_cancelled():
                 return None
@@ -795,15 +810,21 @@ class ChatService:
             if response.reasoning_content:
                 assistant_msg["reasoning_content"] = response.reasoning_content
             llm_messages.append(assistant_msg)
+            batch_history = ([{**assistant_msg, "tool_calls": [asdict(tc) for tc in response.tool_calls]}]
+                             if tool_history is not None else None)
+            # Protocol output is only needed within this live tool loop. Keep
+            # saved history provider-neutral and free of encrypted reasoning.
+            if getattr(response, "responses_output_items", None):
+                assistant_msg["responses_output_items"] = response.responses_output_items
 
             for tc in response.tool_calls:
                 if group_scope and group_scope.is_cancelled():
                     return None
                 generated_image_count = len(generated_images)
                 try:
-                    if group_scope and tc.name not in allowed_tool_names:
+                    if tc.name not in allowed_tool_names:
                         raise ValueError("本轮未授权使用此工具")
-                    result_blocks = self._execute_tool(
+                    outcome = self._execute_tool_with_status(
                         tc,
                         timeout=timeout,
                         persona=persona,
@@ -814,10 +835,10 @@ class ChatService:
                         memory_context=memory_context,
                         group_scope=group_scope,
                     )
+                    result_blocks = outcome.blocks
                 except Exception as exc:
-                    result_blocks = [ContentBlock(
-                        type="text", text=f"工具调用失败: {exc}",
-                    )]
+                    result_blocks = [ContentBlock(type="text", text=f"工具调用失败: {exc}")]
+                    outcome = ToolExecutionResult(result_blocks, True)
                 else:
                     if group_scope and group_scope.is_cancelled():
                         return None
@@ -832,12 +853,36 @@ class ChatService:
                             **({"media_dir": group_scope.media_dir} if group_scope else {}),
                         )
                         generated_images.extend(saved)
-                llm_messages.append({
+                result_blocks, tool_images = self._prepare_tool_images(
+                    result_blocks, generated_images[generated_image_count:],
+                    pending_images, persona_id, capabilities,
+                    media_dir=group_scope.media_dir if group_scope else None,
+                )
+                tool_message = {
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "_function_name": tc.name,
                     "content": result_blocks,
-                })
+                    "_tool_is_error": outcome.is_error,
+                }
+                llm_messages.append(tool_message)
+                if batch_history is not None:
+                    text = content_blocks_to_text(result_blocks)
+                    # Bound stored output, not the current invocation's live result.
+                    limit = 12000
+                    marker = "\n[历史工具输出已截断；需要更多内容时可重新读取或查询。]"
+                    if len(text) > limit:
+                        text = text[:limit - len(marker)] + marker
+                    batch_history.append({**tool_message, "content": text})
+                # Transient attachments are expanded by the protocol converters,
+                # after all results in this batch. History uses the saved reply
+                # images instead, so never persist these bytes a second time.
+                if tool_images:
+                    tool_message["_tool_images"] = tool_images
+            if tool_history is not None and batch_history is not None:
+                # Commit only complete call/result groups; cancellation never
+                # leaves orphan tool calls in a subsequently replayed request.
+                tool_history.extend(batch_history)
 
         if response is not None and not loop_completed:
             # Hit when the LLM keeps asking for tools for max_iter rounds and
@@ -882,10 +927,10 @@ class ChatService:
         """Build the LLM message list from raw per-message history.
 
         Consecutive same-role messages (within a round) are merged so the
-        final list strictly alternates user / assistant.
+        text and media retain their order within each merged role run.
 
         ``pending_images`` / ``pending_files`` are call-scoped dicts populated
-        by ``_attach_images`` / ``_attach_files`` when the LLM lacks native
+        by ``_image_parts`` / ``_file_parts`` when the LLM lacks native
         vision/file support — the LLM then queries them via tool calls.
         Callers that may run concurrently must pass fresh dicts.
 
@@ -969,55 +1014,69 @@ class ChatService:
                 llm_messages.append({"role": "system", "content": reminder})
 
         merged: list[dict] = []
+        history = self._resolve_history_media(history, images, files)
         for msg in history:
             role = msg.get("role", "user")
-            content_blocks = msg.get("content", [])
-            text_parts = [
-                b["text"]
-                for b in content_blocks
-                if b.get("type") == "text" and b.get("text")
-            ]
-            has_image = any(b.get("type") == "image" for b in content_blocks)
-            file_hints = self._file_hints_from_blocks(content_blocks)
-            voice_hints = self._voice_hints_from_blocks(content_blocks)
-            text = "\n".join(text_parts)
-            if not text and has_image:
-                text = "[图片]"
-            if file_hints:
-                text = f"{text}\n{file_hints}" if text else file_hints
-            if voice_hints:
-                text = f"{text}\n{voice_hints}" if text else voice_hints
-            # Inject the quote marker after the media/file fallbacks so an
-            # image-only quoted message keeps its [图片] placeholder for the LLM.
+            if role == "assistant" and msg.get("tool_history"):
+                merged.extend(self._history_tool_messages(
+                    msg["tool_history"], capabilities, prefix=f"history_{len(merged)}",
+                    active_tool_names=active_tool_names,
+                ))
+            parts: list[dict] = []
             quote = msg.get("quote", "")
             quoted_voices = self._voice_hints_from_blocks(msg.get("quote_media", []))
             if quoted_voices and quoted_voices not in quote:
                 quote = f"{quote}\n{quoted_voices}"
-            text = inject_quote_prefix(text, quote)
-            if not text:
+            if quote:
+                parts.append({"type": "text", "text": inject_quote_prefix("", quote)})
+            source = {
+                "speaker": msg.get("speaker_name") or ("助手" if role == "assistant" else "用户"),
+                "timestamp": msg.get("timestamp", ""),
+            }
+            for quoted, blocks in ((True, msg.get("quote_media", [])),
+                                   (False, msg.get("content", []))):
+                for block in blocks:
+                    kind = block.get("type")
+                    if quoted and kind == "emoji":
+                        kind = "image"
+                    if kind in {"image", "file"}:
+                        # Resolve one occurrence, never the flattened attachment list.
+                        item = dict(block)
+                        if quoted:
+                            item["_context_label"] = "[引用附件]"
+                        else:
+                            item.pop("_context_label", None)
+                        if kind == "image":
+                            attached = self._image_parts(
+                                item, capabilities, pending_images, persona_id,
+                            )
+                        else:
+                            attached = self._file_parts(item, pending_files, persona_id)
+                        for part in attached:
+                            if part.get("type") == "image":
+                                part["_history_source"] = source
+                        parts.extend(attached)
+                    elif not quoted:
+                        text = (self._voice_hints_from_blocks([block]) if kind == "voice"
+                                else block.get("text", "") if kind == "text" else "")
+                        if text:
+                            parts.append({"type": "text", "text": text})
+            if not parts:
                 continue
-
             if role == "user":
-                time_prefix = format_message_time(msg.get("timestamp"))
-                text = f"{time_prefix}\n{text}"
-
-            if merged and merged[-1]["role"] == role:
-                cur = merged[-1]["content"]
-                cur_text = cur if isinstance(cur, str) else str(cur)
-                if role == "user":
-                    sep = "\n"
-                elif contains_voice_marker(cur_text.rsplit("\n", 1)[-1]):
-                    # Never join with \ right after a voice hint: per the
-                    # marker grammar, \ would pull the following content into
-                    # the voice's scope, so history would claim the next
-                    # text/image was part of that clip. A newline at least
-                    # reads differently from an in-voice pause.
-                    sep = "\n"
-                else:
-                    sep = "\\"
-                merged[-1]["content"] = cur_text + sep + text
+                parts.insert(0, {"type": "text", "text": format_message_time(msg.get("timestamp"))})
+            content = self._compact_content(parts)
+            if (merged and merged[-1]["role"] == role
+                    and not (role == "assistant" and msg.get("tool_history"))):
+                old = self._content_parts(merged[-1]["content"])
+                tail = old[-1].get("text", "") if old else ""
+                sep = "\n" if role == "user" or contains_voice_marker(tail.rsplit("\n", 1)[-1]) else "\\"
+                merged[-1]["content"] = self._compact_content(
+                    old + [{"type": "text", "text": sep}] + self._content_parts(content),
+                    separator="",
+                )
             else:
-                merged.append({"role": role, "content": text})
+                merged.append({"role": role, "content": content})
 
         llm_messages.extend(merged)
 
@@ -1030,12 +1089,57 @@ class ChatService:
             )
             llm_messages.append({"role": "user", "content": hint_text})
 
-        if images:
-            self._attach_images(llm_messages, images, capabilities, pending_images)
-        if files:
-            self._attach_files(llm_messages, files, pending_files)
+        if not history:
+            parts = []
+            for item in images or []:
+                parts.extend(self._image_parts(
+                    item, capabilities, pending_images, persona_id,
+                ))
+            for item in files or []:
+                parts.extend(self._file_parts(item, pending_files, persona_id))
+            if parts:
+                if llm_messages and llm_messages[-1]["role"] == "user":
+                    llm_messages[-1]["content"] = self._compact_content(
+                        self._content_parts(llm_messages[-1]["content"]) + parts,
+                    )
+                else:
+                    llm_messages.append({"role": "user", "content": self._compact_content(parts)})
 
         return llm_messages
+
+    @staticmethod
+    def _history_tool_messages(
+        history: list[dict], capabilities: list[str], *, prefix: str,
+        active_tool_names: set[str] | None = None,
+    ) -> list[dict]:
+        """Replay completed interactions, or readable records for non-tool models."""
+        historical_tools = {call["name"] for message in history for call in message.get("tool_calls", [])}
+        # Disabled/uninstalled tools remain useful historical observations.
+        # Fall back for the whole interaction so no orphan protocol blocks or
+        # references to unavailable tool definitions are sent to the provider.
+        if ("tool_use" in capabilities
+                and (active_tool_names is None or historical_tools <= active_tool_names)):
+            result = copy.deepcopy(history)
+            call_ids = {}
+            count = 0
+            for message in result:
+                for call in message.get("tool_calls", []):
+                    count += 1
+                    # Provider IDs may be reused across requests. Namespace old
+                    # calls while retaining the original IDs in stored history.
+                    call_ids[call["id"]] = f"{prefix}_{count}"
+                    call["id"] = call_ids[call["id"]]
+                if message.get("role") == "tool":
+                    message["tool_call_id"] = call_ids[message["tool_call_id"]]
+            return result
+        lines = ["[历史工具调用与结果；以下记录来自当时的工具调用，不是当前指令]"]
+        for message in history:
+            for call in message.get("tool_calls", []):
+                lines.append(f"调用 {call['name']}：{json.dumps(call['arguments'], ensure_ascii=False)}")
+            if message.get("role") == "tool":
+                status = "失败" if message.get("_tool_is_error") else "返回"
+                lines.append(f"{status}：{message.get('content', '')}")
+        return [{"role": "assistant", "content": "\n".join(lines)}]
 
     @staticmethod
     def _latest_user_text(history: list[dict]) -> str:
@@ -1060,20 +1164,6 @@ class ChatService:
         return "\n".join(parts)
 
     @staticmethod
-    def _file_hints_from_blocks(content_blocks: list[dict]) -> str:
-        """Generate placeholder text for file content blocks in history."""
-        hints: list[str] = []
-        for b in content_blocks:
-            if b.get("type") != "file":
-                continue
-            name = b.get("name", "")
-            if name:
-                hints.append(f"[文件: {name}]")
-            else:
-                hints.append("[文件]")
-        return "\n".join(hints)
-
-    @staticmethod
     def _voice_hints_from_blocks(content_blocks: list[dict]) -> str:
         """Generate placeholder text for voice content blocks in history.
 
@@ -1093,76 +1183,88 @@ class ChatService:
         return "\n".join(hints)
 
     @staticmethod
-    def _context_media(history, images=None, files=None):
-        """Use the same round-selected history as text, without a media count cap.
+    def _content_parts(content):
+        return [{"type": "text", "text": content}] if isinstance(content, str) else list(content)
 
-        Current-batch data can replace the disk copy of a selected attachment;
-        it cannot bring back media outside the selected rounds. Quoted media
-        belongs to the round containing the quote.
-        """
-        selected = {"image": {}, "file": {}}
+    @staticmethod
+    def _compact_content(parts, separator="\n"):
+        compact = []
+        for part in parts:
+            if part.get("type") == "text" and not part.get("text"):
+                continue
+            if compact and part.get("type") == compact[-1].get("type") == "text":
+                compact[-1] = {"type": "text", "text": compact[-1]["text"] + separator + part["text"]}
+            else:
+                compact.append(dict(part))
+        if all(p.get("type") == "text" for p in compact):
+            return "".join(p["text"] for p in compact)
+        return compact
+
+    @staticmethod
+    def _resolve_history_media(history, images=None, files=None):
+        """Hydrate attachments in a copy, retaining every sending/quoting event."""
+        history = copy.deepcopy(history)
         current = {"image": {}, "file": {}}
-        # The queue persists the current batch at the end of history, stripping
-        # raw image data. Match its pathless images from the end of the trailing
-        # user run so older placeholders (including unanswered messages) cannot
-        # consume this batch's bytes. Quotes are never current upload slots.
-        memory_images = [img for img in images or [] if not img.get("path")]
-        memory_slots = []
+        for kind, items in (("image", images), ("file", files)):
+            for item in items or []:
+                if item.get("path"):
+                    try:
+                        current[kind][str(Path(item["path"]).resolve())] = item
+                    except (OSError, ValueError):
+                        pass
+        # Current pathless uploads fill the trailing user run from the end;
+        # older placeholders and quoted attachments must not consume new bytes.
+        slots = []
         for message in reversed(history):
             if message.get("role") != "user":
                 break
             for block in reversed(message.get("content", [])):
                 if (block.get("type") == "image" and not block.get("path")
                         and block.get("data") is None and not block.get("expired")):
-                    memory_slots.append(block)
-        memory_overrides = {
-            id(block): img for block, img in zip(memory_slots, reversed(memory_images))
-        }
-        for kind, blocks in (("image", images), ("file", files)):
-            for block in blocks or []:
-                if block.get("path"):
-                    try:
-                        current[kind][str(Path(block["path"]).resolve())] = block
-                    except (OSError, ValueError):
-                        continue
-
-        def add(kind, block, context=""):
-            if block.get("expired"):
-                return
-            item = dict(block)
-            path = item.get("path")
-            try:
-                key = str(Path(path).resolve()) if path else None
-                item.update(current[kind].get(key, {}))
-                if kind == "image" and not path and item.get("data") is None:
-                    item.update(memory_overrides.get(id(block), {}))
-                if not (kind == "image" and item.get("data") is not None):
-                    if not path or not Path(path).is_file():
-                        item["_unavailable"] = True
-            except (OSError, ValueError):
-                return
-            # In-memory images without paths remain usable for this round.
-            key = key or ("memory", id(block))
-            previous = selected[kind].get(key)
-            if previous:
-                item = {**previous, **item}
-            if context and "_context_label" not in item:
-                item["_context_label"] = context
-            selected[kind][key] = item
-
+                    slots.append(block)
+        memory = [item for item in images or [] if not item.get("path")]
+        for block, item in zip(slots, reversed(memory)):
+            for key in ("data", "mime"):
+                if key in item:
+                    block[key] = item[key]
         for message in history:
-            role = message.get("speaker_name") or (
-                "用户" if message.get("role") == "user" else "助手"
+            for field in ("content", "quote_media"):
+                for block in message.get(field, []):
+                    kind = "image" if field == "quote_media" and block.get("type") == "emoji" else block.get("type")
+                    if kind not in current or block.get("expired"):
+                        continue
+                    try:
+                        path = block.get("path")
+                        if path:
+                            override = current[kind].get(str(Path(path).resolve()), {})
+                            # Only bytes and MIME override a persisted occurrence's metadata.
+                            for key in ("data", "mime"):
+                                if key in override:
+                                    block[key] = override[key]
+                        if not (kind == "image" and block.get("data") is not None):
+                            if not path or not Path(path).is_file():
+                                block["_unavailable"] = True
+                    except (OSError, ValueError):
+                        block["_unavailable"] = True
+        return history
+
+    @staticmethod
+    def _context_images(history, images=None):
+        """Expose selected images to extensions without changing message placement."""
+        selected = []
+        for message in ChatService._resolve_history_media(history, images):
+            speaker = message.get("speaker_name") or (
+                "助手" if message.get("role") == "assistant" else "用户"
             )
-            label = f"[上下文附件：{role}，{message.get('timestamp', '')}]"
-            for block in message.get("content", []):
-                if block.get("type") in selected:
-                    add(block["type"], block, label)
-            for block in message.get("quote_media", []):
-                kind = "image" if block.get("type") == "emoji" else block.get("type")
-                if kind in selected:
-                    add(kind, block, label + "（引用附件）")
-        return list(selected["image"].values()), list(selected["file"].values())
+            label = f"[上下文附件：{speaker}，{message.get('timestamp', '')}]"
+            for field in ("content", "quote_media"):
+                for block in message.get(field, []):
+                    kind = "image" if field == "quote_media" and block.get("type") == "emoji" else block.get("type")
+                    if kind == "image" and not block.get("expired"):
+                        item = dict(block)
+                        item["_context_label"] = label + ("（引用附件）" if field == "quote_media" else "")
+                        selected.append(item)
+        return selected
 
     @staticmethod
     def _image_to_b64(img: dict) -> str:
@@ -1175,88 +1277,100 @@ class ChatService:
             raw = Path(path).read_bytes()
         return base64.b64encode(raw).decode("ascii") if isinstance(raw, bytes) else raw
 
-    def _attach_images(
+    def _image_parts(
         self,
-        messages: list[dict],
-        images: list[dict],
+        image: dict,
         capabilities: list[str],
         pending_images: dict[str, dict],
-    ):
-        """Attach image data to the last user message or append a new one.
+        persona_id: str,
+    ) -> list[dict]:
+        """Render one sending event and authorize nonvisual tool access."""
+        label = image.get("_context_label", "")
+        unavailable = [{"type": "text", "text": f"{label}[图片附件已失效]"}]
+        if image.get("expired") or image.get("_unavailable"):
+            return unavailable
+        try:
+            b64 = self._image_to_b64(image)
+            mime = image.get("mime", "image/jpeg")
+            if "vision" in capabilities:
+                base64.b64decode(b64, validate=True)
+            else:
+                image_id = self._register_image(b64, mime, pending_images, persona_id)
+        except (OSError, ValueError, TypeError):
+            # A historical file can disappear between selection and read.
+            return unavailable
+        if "vision" in capabilities:
+            parts = [{"type": "text", "text": label}] if label else []
+            parts.append({"type": "image", "data": b64,
+                          "mime_type": mime})
+        else:
+            parts = [{"type": "text", "text": f"{label}[图片 ID:{image_id}]"}]
+        return parts
 
-        ``pending_images`` is mutated in-place when the LLM lacks native
-        vision so the tool layer can later resolve ``[图片 ID:xxx]`` hints.
+    @staticmethod
+    def _register_image(b64: str, mime: str, pending_images: dict, persona_id: str) -> str:
+        """Stable resource identity; access is granted only in this round's map."""
+        if not b64:
+            raise ValueError("Empty image")
+        digest = hashlib.sha256(base64.b64decode(b64, validate=True)).hexdigest()
+        image_id = "img_" + hashlib.sha256(f"{persona_id}:{digest}".encode()).hexdigest()[:16]
+        pending_images[image_id] = {"data": b64, "mime": mime}
+        return image_id
+
+    def _prepare_tool_images(
+        self, blocks, generated, pending_images, persona_id, capabilities, *, media_dir=None,
+    ):
+        """Register saved tool images once per result, including text extractions.
+
+        Text references work for every model. Visual payloads are ephemeral;
+        the normal generated-image messages own their persisted history.
         """
-        has_vision = "vision" in capabilities
-        blocks = []
-        hints = []
-        for img in images:
-            label = img.get("_context_label", "")
+        # Use the same saved artifacts as the outgoing assistant messages.
+        # Raw MCP payloads can use unpadded base64 or an incorrect MIME; the
+        # extractor already normalizes these. Processing both representations
+        # duplicates decoding and can expose an image that was never saved.
+        result = [block for block in blocks if block.type != "image"]
+        images = []
+        seen = set()
+
+        for item in generated:
             try:
-                b64 = self._image_to_b64(img)
-            except (OSError, ValueError):
-                # A historical file can disappear between selection and read.
-                blocks.append({"type": "text", "text": f"{label}[图片附件已失效]"})
-                hints.append(f"{label}[图片附件已失效]")
+                if media_dir is not None and item.get("path"):
+                    if not Path(item["path"]).resolve().is_relative_to(media_dir):
+                        raise ValueError("Tool image is outside the group staging directory")
+                b64 = self._image_to_b64(item)
+                mime = item.get("mime", "image/png")
+                image_id = self._register_image(b64, mime, pending_images, persona_id)
+            except (OSError, ValueError, TypeError):
+                result.append(ContentBlock(text="[工具返回的图片附件已失效]"))
                 continue
-            if has_vision:
-                if label:
-                    blocks.append({"type": "text", "text": label})
-                blocks.append({"type": "image", "data": b64,
-                               "mime_type": img.get("mime", "image/jpeg")})
-            else:
-                img_id = f"img_{secrets.token_hex(4)}"
-                pending_images[img_id] = {"data": b64, "mime": img.get("mime", "image/jpeg")}
-                hints.append(f"{label}[图片 ID:{img_id}]")
+            if image_id in seen:
+                continue
+            seen.add(image_id)
+            result.append(ContentBlock(text=f"[本次工具返回图片 ID:{image_id}]"))
+            if "vision" in capabilities:
+                images.extend([
+                    {"type": "text", "text": f"[图片 ID:{image_id}]"},
+                    {"type": "image", "data": b64, "mime_type": mime},
+                ])
 
-        if has_vision:
-            if messages and messages[-1]["role"] == "user":
-                existing = messages[-1].get("content", "")
-                prefix = [{"type": "text", "text": existing}] if isinstance(existing, str) else list(existing)
-                messages[-1]["content"] = prefix + blocks
-            elif blocks:
-                messages.append({"role": "user", "content": blocks})
+        return result, images
+
+    @staticmethod
+    def _file_parts(file: dict, pending_files: dict[str, dict], persona_id: str) -> list[dict]:
+        """Render a file reference at its occurrence and authorize tool access."""
+        label = file.get("_context_label", "")
+        name = file.get("name", "")
+        if file.get("expired") or file.get("_unavailable"):
+            text = f"{label}[文件附件已失效: {name}]"
         else:
-            hint_text = "\n".join(hints)
-            if messages and messages[-1]["role"] == "user":
-                cur = messages[-1].get("content", "")
-                messages[-1]["content"] = f"{cur}\n{hint_text}" if cur else hint_text
-            elif hints:
-                messages.append({"role": "user", "content": hint_text})
-
-    def _attach_files(
-        self,
-        messages: list[dict],
-        files: list[dict],
-        pending_files: dict[str, dict],
-    ):
-        """Attach file references as text hints, populating *pending_files*."""
-        hints: list[str] = []
-        for f in files:
-            if f.get("_unavailable"):
-                hints.append(f"{f.get('_context_label', '')}[文件附件已失效: {f.get('name', '')}]")
-                continue
-            file_id = f"file_{secrets.token_hex(4)}"
+            file_id = "file_" + hashlib.sha256(f"{persona_id}:{file.get('path', '')}".encode()).hexdigest()[:16]
             pending_files[file_id] = {
-                "path": f.get("path", ""),
-                "name": f.get("name", ""),
-                "mime": f.get("mime", "application/octet-stream"),
+                "path": file.get("path", ""), "name": name,
+                "mime": file.get("mime", "application/octet-stream"),
             }
-            name = f.get("name", "")
-            if name:
-                hints.append(f"{f.get('_context_label', '')}[文件: {name} ID:{file_id}]")
-            else:
-                hints.append(f"{f.get('_context_label', '')}[文件 ID:{file_id}]")
-
-        hint_text = "\n".join(hints)
-        if messages and messages[-1]["role"] == "user":
-            cur = messages[-1].get("content", "")
-            if isinstance(cur, str):
-                messages[-1]["content"] = f"{cur}\n{hint_text}" if cur else hint_text
-            elif isinstance(cur, list):
-                messages[-1]["content"] = cur + [{"type": "text", "text": hint_text}]
-        else:
-            messages.append({"role": "user", "content": hint_text})
+            text = f"{label}[文件: {name} ID:{file_id}]" if name else f"{label}[文件 ID:{file_id}]"
+        return [{"type": "text", "text": text}]
 
     # ---- Tool collection and execution ------------------------------------
 
@@ -1284,43 +1398,60 @@ class ChatService:
         return tools or None
 
     # Per-provider prompt-style guidance. NovelAI expects English danbooru-style
-    # comma-separated tags; OpenAI / Gemini expect natural language. The
-    # variable-segment hint is the only place where the prompt styles
-    # meaningfully diverge.
+    # comma-separated tags; OpenAI / Gemini expect natural language.
+    # Size guidance also follows the selected model's actual transport.
     _IMG_VARIABLE_HINT_NATURAL = (
-        "你的 prompt 参数应当**只**描述这些可变内容："
-        "场景与环境（地点、时间、天气、背景）、角色的动作/姿态/表情、"
-        "镜头与光线（如 50mm lens, soft sunlight, shallow depth of field）。"
+        "prompt 描述本次画面的场景与环境（地点、时间、天气、背景）、"
+        "角色的动作、姿态和表情，以及镜头与光线（如 50mm lens, soft sunlight, shallow depth of field）。"
     )
     _IMG_VARIABLE_HINT_NAI = (
-        "你的 prompt 参数应当**只**描述这些可变内容，且必须使用**英文小写、逗号分隔的"
-        "danbooru 风格标签**（NovelAI v4/v4.5 对标签更敏感，自然语言句子效果差）："
-        "场景标签（地点、时间、天气、背景物件，如 `cafe interior, evening, neon lights`）"
-        "→ 角色动作/姿态/表情（`sitting, holding cup, smiling`）"
-        "→ 服饰细节（仅当与 art_style/style_prefix 中已有的不冲突时补充）"
-        "→ 镜头/光线/构图（`close-up, soft lighting, depth of field`）。"
-        "不要写整句中文，不要写 `a photo of ...` 这类自然语言。"
+        "prompt 使用英文小写、逗号分隔的 danbooru 风格标签。"
+        "按以下顺序描述本次画面：场景（如 `cafe interior, evening, neon lights`）"
+        "→ 动作和表情（`sitting, holding cup, smiling`）"
+        "→ 与已设定服饰一致的细节 → 镜头、光线与构图（`close-up, soft lighting, depth of field`）。"
     )
     _IMG_FALLBACK_HINT_NATURAL = (
-        "prompt 结构推荐：「角色形象描述, 场景与动作, 光线/镜头/画风」。"
-        "角色形象描述需基于[人设设定]中 appearance/attire 字段（发色、瞳色、"
-        "身高、体型、服饰、神态），不要让画面与人设冲突。"
+        "prompt 可按「角色形象、场景与动作、光线与镜头、画风」组织。"
+        "需要人物时，根据[人设设定]中的 appearance/attire 字段描述发色、瞳色、体型和服饰。"
     )
     _IMG_FALLBACK_HINT_NAI = (
-        "prompt 必须使用**英文小写、逗号分隔的 danbooru 风格标签**。"
+        "prompt 使用英文小写、逗号分隔的 danbooru 风格标签。"
         "推荐顺序：质量与画风标签（如 `masterpiece, best quality, anime`）→ "
-        "角色形象标签（基于[人设设定]中 appearance/attire 字段：发色、瞳色、服饰）→ "
+        "角色形象（需要人物时，根据[人设设定]中的 appearance/attire 字段描述发色、瞳色和服饰）→ "
         "场景与动作（地点、姿态、表情）→ 镜头/光线/构图。"
-        "不要写整句中文，不要写 `a photo of ...` 这类自然语言。"
+    )
+    _IMG_SIZE_RULE = (
+        "- 图片尺寸与构图：每次调用 generate_image 都应明确填写 width 和 height，"
+        "下列尺寸均按宽×高排列。优先遵循用户指定的比例/方向，并在当前接口可用尺寸中选择；"
+        "没有对应比例时选择最接近的可用比例。"
+        "用户未指定时，根据画面主动选择：人物自拍、半身/全身像可选竖图；"
+        "风景、房间全景、多人同框可选横图；头像、居中静物或对称构图可选方图。"
+    )
+    _IMG_GEMINI_SIZE_RULE = (
+        "当前 Gemini 原生接口通过宽高比控制画幅，可选：1024×1024（1:1 方图）、"
+        "768×1024（3:4 竖图）、1024×768（4:3 横图）、"
+        "576×1024（9:16 竖图）、1024×576（16:9 横图）。"
+    )
+    _IMG_GEMINI_CHAT_SIZE_RULE = (
+        "当前 Gemini 聊天兼容接口通过 prompt 描述画幅，width/height 不传给上游。"
+        "请在 prompt 的镜头/构图部分写明目标比例和方向，"
+        "例如 `portrait composition, 3:4 aspect ratio` 或 "
+        "`landscape composition, 16:9 aspect ratio`。"
+        "尺寸参考：768×1024（3:4 竖图）、1024×768（4:3 横图）、"
+        "576×1024（9:16 竖图）、1024×576（16:9 横图）、1024×1024（1:1 方图）。"
+    )
+    _IMG_OPENAI_SIZE_RULE = (
+        "当前 OpenAI 兼容图片接口会直接发送 width×height 作为 size。"
+        "GPT Image 常用尺寸：1536×1024（3:2 横图）、1024×1536（2:3 竖图）、"
+        "1024×1024（1:1 方图）。"
     )
     _IMG_NAI_SIZE_RULE = (
-        "尺寸请优先使用以下普通安全档：1024×1024（方图）、1216×832（横屏）、"
-        "832×1216（竖屏）。其他尺寸会被自动吸附到最近的安全档。"
+        "当前 NovelAI 可选尺寸：1024×1024（方图）、1216×832（横图）、"
+        "832×1216（竖图）。其他尺寸按宽高比匹配到最近的预设。"
     )
     _IMG_NAI_V4_REF_RULE = (
-        "当前 NovelAI v4/v4.5 模型不会接收头像/自定义参考图；"
-        "不要依赖参考图保持外观。若已配置的画面风格或角色形象提示未覆盖必要固定外观，"
-        "请用少量英文标签补足关键外观细节。"
+        "当前 NovelAI v4/v4.5 通过文字描述角色外观，不接收头像或自定义参考图。"
+        "对于人物画面，配置提示词中未涵盖的关键外观可用英文标签补充。"
     )
 
     def _build_image_tool_guidance(
@@ -1338,9 +1469,9 @@ class ChatService:
         LLM would dutifully restate the character description and the final
         prompt would contain duplicates.
 
-        Branches on the persona's image-backend type: NovelAI wants English
-        danbooru tags + normal-safe size guidance; OpenAI / Gemini keep the
-        natural-language guidance.
+        Branches on the persona's image-backend type for prompt style and
+        supported sizes. Chat-mode Gemini needs aspect intent in the prompt
+        because its transport does not send width/height.
 
         ``active_tool_names`` controls which tool-specific subsections are
         included — only the rules for tools actually exposed to this round
@@ -1372,59 +1503,67 @@ class ChatService:
         if gen_active:
             if auto_parts:
                 lines.append(
-                    "调用 generate_image 时，以下内容会被系统自动拼接到你提供的 prompt 之前——"
-                    "你**不需要也不应该**在 prompt 里重复或修改它们：",
+                    "调用 generate_image 时，系统会在 prompt 前自动添加以下内容，"
+                    "你只需补充本次画面的细节：",
                 )
                 for part in auto_parts:
                     lines.append(f"  · {part}")
-                # Show the LLM the final stitched prompt shape so it sees its
-                # own argument is just the trailing scene description.
-                head = ", ".join(
-                    p.split("：", 1)[1] for p in auto_parts
-                )
-                lines.append(
-                    f"  最终发给生图模型的 prompt 形如：`{head}, {{你提供的 prompt}}`",
-                )
                 lines.append(self._IMG_VARIABLE_HINT_NAI if is_nai else self._IMG_VARIABLE_HINT_NATURAL)
             else:
                 lines.append(self._IMG_FALLBACK_HINT_NAI if is_nai else self._IMG_FALLBACK_HINT_NATURAL)
 
+            lines.append(self._IMG_SIZE_RULE)
             if is_nai:
                 lines.append(self._IMG_NAI_SIZE_RULE)
-
-            if is_nai_v4 and ref_mode in {"custom", "avatar"}:
-                lines.append(self._IMG_NAI_V4_REF_RULE)
-            elif ref_mode == "custom":
-                lines.append(
-                    "当前角色默认会自动附加一张自定义参考图给支持的生图模型；"
-                    "不要在 prompt 里重复描述那张图里的固定外观。",
-                )
-            elif ref_mode == "avatar":
-                lines.append(
-                    "当前角色默认会把头像作为参考图传给支持的生图模型；"
-                    "不要在 prompt 里重复描述头像中的固定外观。",
-                )
+            elif model_type == "gemini_image":
+                lines.append(self._IMG_GEMINI_SIZE_RULE)
+            elif model_type == "gemini_chat_image":
+                lines.append(self._IMG_GEMINI_CHAT_SIZE_RULE)
+            elif model_type == "openai_image":
+                model_id = ig["model"].strip().lower()
+                if model_id == "dall-e-2":
+                    lines.append(
+                        "当前 DALL·E 2 仅支持方图：1024×1024、512×512、256×256。"
+                        "请保持 width=height。",
+                    )
+                elif model_id == "dall-e-3":
+                    lines.append(
+                        "当前 DALL·E 3 可选尺寸：1792×1024（横图）、"
+                        "1024×1792（竖图）、1024×1024（方图）。",
+                    )
+                else:
+                    lines.append(self._IMG_OPENAI_SIZE_RULE)
 
             if ref_mode in {"custom", "avatar"}:
-                lines.append(
-                    "- `use_reference_image` 参数：默认 true（带上角色形象参考图）。"
-                    "纯风景、物品、食物、抽象画面等**不需要出现人物**的场景请传 false，"
-                    "避免角色被参考图强行带入。人物特写或需要保持外观一致时省略或传 true。",
-                )
+                if is_nai_v4:
+                    lines.append(self._IMG_NAI_V4_REF_RULE)
+                elif model_type == "openai_image":
+                    lines.append(
+                        "当前 OpenAI 图片接口通过文字描述角色外观，不接收参考图。"
+                        "对于人物画面，配置提示词中未涵盖的关键外观可在 prompt 中补充。",
+                    )
+                else:
+                    ref_source = "自定义图片" if ref_mode == "custom" else "头像"
+                    lines.append(
+                        f"当前角色使用{ref_source}作为形象参考图，系统会将其附加给生图模型。"
+                        "角色外观由参考图提供，prompt 侧重本次场景和动作。",
+                    )
+                    lines.append(
+                        "- `use_reference_image` 控制本次是否附加角色参考图，默认 true。"
+                        "人物画面需要参考角色外观时用 true，纯风景、物品、食物或抽象画面用 false。",
+                    )
 
             lines.extend([
-                "- 仅在用户明确请求图片或当前场景确实适合用图片回应时调用，不要滥用。",
-                "- 同一对话多次生图时，场景/动作要自然过渡，不要前后矛盾。",
-                "- 直接描述画面，不要写元指令（如『生成一张』『画一幅』）。",
+                "- 用户请求图片或当前情节适合用图片回应时调用。",
+                "- 连续生图时，让场景和动作随对话自然推进。",
+                "- prompt 直接描述画面内容。",
             ])
 
         if view_active:
             lines.append(
-                "- `view_reference_image` 工具：当你需要描述/确认自己的外观"
-                "（发色、瞳色、服饰等），或者要决定生图细节、回应用户对外观的提问之前，"
-                "先调用 `view_reference_image` 拿到形如 `[图片 ID:img_xxx]` 的图片 ID，"
-                "随后用 `recognize_image` 工具并把 `image_id` 设为该 ID 读取图片内容。"
-                "同一轮里仅在确有必要时调用一次，不要重复刷。",
+                "- 需要确认外观或参考图中的细节时，调用 `view_reference_image` 获取图片 ID"
+                "（形如 `[图片 ID:img_xxx]`），再将该 ID 传给 `recognize_image` 的 `image_id` 参数读取图片。"
+                "同一轮对话中可复用已读取的结果。",
             )
 
         return "\n".join(lines)
@@ -1637,7 +1776,10 @@ class ChatService:
             return [t for t in tools if t.get("name") != "update_memory"]
         return tools
 
-    def _execute_tool(
+    def _execute_tool(self, tc: ToolCall, timeout: int, **kwargs) -> list[ContentBlock]:
+        return self._execute_tool_with_status(tc, timeout, **kwargs).blocks
+
+    def _execute_tool_with_status(
         self,
         tc: ToolCall,
         timeout: int,
@@ -1649,12 +1791,12 @@ class ChatService:
         pending_files: dict[str, dict] | None = None,
         memory_context: dict | None = None,
         group_scope: _GroupGenerationScope | None = None,
-    ) -> list[ContentBlock]:
+    ) -> ToolExecutionResult:
         if group_scope:
             if group_scope.is_cancelled():
-                return [ContentBlock(type="text", text="本次群聊发言已停止。")]
+                return ToolExecutionResult([ContentBlock(text="本次群聊发言已停止。")], True)
             if tc.name in {"record_memory", "update_memory"} and not self.group_memory_service:
-                return [ContentBlock(type="text", text="群聊只能读取长期记忆，不能写入。")]
+                return ToolExecutionResult([ContentBlock(text="群聊只能读取长期记忆，不能写入。")], True)
         if self.capability_registry and self.capability_registry.is_capability_tool(tc.name):
             scope_context = {
                 "conversation_type": "group",
@@ -1664,24 +1806,23 @@ class ChatService:
                 "memory_mode": "group" if self.group_memory_service else "read_only",
                 "is_cancelled": group_scope.is_cancelled,
             } if group_scope else {}
-            return self.capability_registry.execute(
-                tc.name, tc.arguments,
-                context={
-                    "pending_images": pending_images if pending_images is not None else {},
-                    "pending_files": pending_files if pending_files is not None else {},
-                    "persona": persona,
-                    "persona_id": persona_id,
-                    "memory_context": memory_context,
-                    "generated_images": generated_images if generated_images is not None else [],
-                    **scope_context,
-                },
-                timeout=timeout,
+            context = {
+                "pending_images": pending_images if pending_images is not None else {},
+                "pending_files": pending_files if pending_files is not None else {},
+                "persona": persona,
+                "persona_id": persona_id,
+                "memory_context": memory_context,
+                "generated_images": generated_images if generated_images is not None else [],
+                **scope_context,
+            }
+            return self.capability_registry.execute_with_status(
+                tc.name, tc.arguments, context=context, timeout=timeout,
             )
 
         if self.mcp_manager:
-            return self.mcp_manager.call_tool(tc.name, tc.arguments, timeout=timeout)
+            return self.mcp_manager.call_tool_with_status(tc.name, tc.arguments, timeout=timeout)
 
-        return [ContentBlock(type="text", text=f"No handler for tool: {tc.name}")]
+        return ToolExecutionResult([ContentBlock(text=f"No handler for tool: {tc.name}")], True)
 
     @staticmethod
     def _filter_by_policy(

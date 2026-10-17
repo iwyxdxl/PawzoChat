@@ -541,8 +541,21 @@ function _presetLabel(id) {
 const _CAPABILITY_LABELS = {
   vision: "视觉", tool_use: "工具调用", streaming: "流式", reasoning: "推理",
 };
+const _OPENAI_ENDPOINTS = { openai_compatible: "/chat/completions", openai_responses: "/responses" };
+let _providerAppendPaths = {};
 
-function _previewUrl(preset, type, baseUrl, appendChat) {
+function _responsesEndpointUrl(baseUrl, endpoint) {
+  try {
+    const url = new URL(baseUrl);
+    const path = url.pathname.replace(/\/+$/, "");
+    url.pathname = (endpoint === "/models" ? path.replace(/\/responses$/, "") : path) + endpoint;
+    return url.href;
+  } catch {
+    return baseUrl.replace(/\/+$/, "") + endpoint;
+  }
+}
+
+function _previewUrl(preset, type, baseUrl, appendPath) {
   if (preset && preset !== "custom") {
     const info = _providerPresets[preset];
     if (!info) return "";
@@ -553,7 +566,8 @@ function _previewUrl(preset, type, baseUrl, appendChat) {
   }
   if (!baseUrl) return "";
   if (type === "anthropic") return baseUrl.replace(/\/+$/, "") + "/messages";
-  if (appendChat) return baseUrl.replace(/\/+$/, "") + "/chat/completions";
+  if (type === "openai_responses" && appendPath) return _responsesEndpointUrl(baseUrl, "/responses");
+  if (appendPath) return baseUrl.replace(/\/+$/, "") + (_OPENAI_ENDPOINTS[type] || "/chat/completions");
   return baseUrl;
 }
 
@@ -632,11 +646,15 @@ async function renderProviderEdit(data) {
     .join("")
     + `<option value="custom" ${(!p.preset || p.preset === "custom") ? "selected" : ""}>自定义</option>`;
 
-  const customTypes = [["openai_compatible", "OpenAI Compatible"], ["anthropic", "Anthropic"]];
+  const customTypes = [["openai_compatible", "OpenAI Compatible"], ["openai_responses", "OpenAI Responses"], ["anthropic", "Anthropic"]];
   const typeOpts = customTypes.map(([v, l]) => `<option value="${v}" ${v === p.type ? "selected" : ""}>${l}</option>`).join("");
 
   const isCustom = !p.preset || p.preset === "custom";
-  const showAppend = isCustom && p.type === "openai_compatible";
+  const showAppend = isCustom && !!_OPENAI_ENDPOINTS[p.type];
+  _providerAppendPaths = {
+    openai_compatible: p.append_chat_path ?? true,
+    openai_responses: p.append_responses_path ?? true,
+  };
 
   content().innerHTML = `<div class="page">
     <div class="card">
@@ -645,8 +663,8 @@ async function renderProviderEdit(data) {
       <div id="pv-custom-fields" style="${isCustom ? "" : "display:none"}">
         <div class="form-group"><div class="form-row"><label>类型</label><select id="pv-type" onchange="PawzoChat.onProviderTypeChange()">${typeOpts}</select></div></div>
         <div class="form-group"><div class="form-row"><label>Base URL</label><input id="pv-url" value="${esc(p.base_url)}" placeholder="https://api.example.com/v1" oninput="PawzoChat.updateProviderPreview()"></div></div>
-        <div class="form-group" id="pv-append-row" style="${showAppend ? "" : "display:none"}"><div class="form-row"><label>拼接 /chat/completions</label>
-          <label class="switch-wrap"><input type="checkbox" id="pv-append" ${p.append_chat_path ? "checked" : ""} onchange="PawzoChat.updateProviderPreview()"><span class="switch-track"></span></label>
+        <div class="form-group" id="pv-append-row" style="${showAppend ? "" : "display:none"}"><div class="form-row"><label id="pv-append-label">拼接 ${_OPENAI_ENDPOINTS[p.type] || "/chat/completions"}</label>
+          <label class="switch-wrap"><input type="checkbox" id="pv-append" data-path-type="${esc(p.type)}" ${_providerAppendPaths[p.type] !== false ? "checked" : ""} onchange="PawzoChat.updateProviderPreview()"><span class="switch-track"></span></label>
         </div></div>
       </div>
       <div class="form-group"><div class="form-row"><label>API Key</label><input type="password" id="pv-key" placeholder="${p.api_key_set ? '已设置 (留空不修改)' : '输入 API Key'}"></div></div>
@@ -661,7 +679,7 @@ async function renderProviderEdit(data) {
       <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
         <span>模型列表</span>
         <div style="display:flex;gap:8px">
-          <button id="pv-fetch-models-btn" class="btn-outline btn-sm" onclick="PawzoChat.fetchRemoteModels()" style="${isCustom && p.type === 'openai_compatible' ? '' : 'display:none'}">拉取模型</button>
+          <button id="pv-fetch-models-btn" class="btn-outline btn-sm" onclick="PawzoChat.fetchRemoteModels()" style="${showAppend ? '' : 'display:none'}">拉取模型</button>
           <button id="pv-import-preset-btn" class="btn-outline btn-sm" onclick="PawzoChat.importPresetModels()" style="${isCustom ? 'display:none' : ''}">导入预设</button>
           <button class="btn-outline btn-sm" onclick="PawzoChat.addEditModel()">添加</button>
         </div>
@@ -735,9 +753,17 @@ export function onProviderTypeChange() {
   const isCustom = preset === "custom";
   const type = $("pv-type")?.value || "openai_compatible";
   const appendRow = $("pv-append-row");
-  if (appendRow) appendRow.style.display = (isCustom && type === "openai_compatible") ? "" : "none";
+  if (appendRow) appendRow.style.display = (isCustom && _OPENAI_ENDPOINTS[type]) ? "" : "none";
+  const appendInput = $("pv-append");
+  if (appendInput) {
+    _providerAppendPaths[appendInput.dataset.pathType] = appendInput.checked;
+    appendInput.checked = _providerAppendPaths[type] ?? true;
+    appendInput.dataset.pathType = type;
+  }
+  const appendLabel = $("pv-append-label");
+  if (appendLabel) appendLabel.textContent = `拼接 ${_OPENAI_ENDPOINTS[type] || "/chat/completions"}`;
   const fetchBtn = $("pv-fetch-models-btn");
-  if (fetchBtn) fetchBtn.style.display = (isCustom && type === "openai_compatible") ? "" : "none";
+  if (fetchBtn) fetchBtn.style.display = (isCustom && _OPENAI_ENDPOINTS[type]) ? "" : "none";
   updateProviderPreview();
 }
 
@@ -745,8 +771,8 @@ export function updateProviderPreview() {
   const preset = $("pv-preset")?.value || "custom";
   const type = $("pv-type")?.value || "openai_compatible";
   const baseUrl = $("pv-url")?.value.trim() || "";
-  const appendChat = $("pv-append")?.checked ?? true;
-  const url = _previewUrl(preset, type, baseUrl, appendChat);
+  const appendPath = $("pv-append")?.checked ?? true;
+  const url = _previewUrl(preset, type, baseUrl, appendPath);
   const el = $("pv-preview");
   if (el) el.textContent = url || "—";
 }
@@ -771,8 +797,9 @@ export function importPresetModels() {
 }
 
 export function fetchRemoteModels() {
-  const baseUrl = ($("pv-url")?.value || "").trim().replace(/\/+$/, "");
-  const defaultUrl = baseUrl ? baseUrl + "/models" : "";
+  const baseUrl = ($("pv-url")?.value || "").trim();
+  const defaultUrl = !baseUrl ? "" : ($("pv-type")?.value === "openai_responses"
+    ? _responsesEndpointUrl(baseUrl, "/models") : baseUrl.replace(/\/+$/, "") + "/models");
   showSheet(`<div class="sheet-body">
     <div class="sheet-title">拉取模型</div>
     <div class="form-stack" style="margin:16px 0">
@@ -1006,7 +1033,8 @@ export async function saveProvider(isNew, oldName) {
   if (preset === "custom") {
     body.type = $("pv-type").value;
     body.base_url = $("pv-url").value.trim();
-    body.append_chat_path = $("pv-append")?.checked ?? true;
+    const appendField = body.type === "openai_responses" ? "append_responses_path" : "append_chat_path";
+    body[appendField] = $("pv-append")?.checked ?? true;
   }
 
   const nameErr = validateProviderName(body.name);

@@ -26,7 +26,7 @@ from google import genai
 from google.genai import types
 
 from pawzochat.llm.base import LLMProvider, LLMResponse, ToolCall
-from pawzochat.llm.converter import mcp_tools_to_gemini
+from pawzochat.llm.converter import mcp_tools_to_gemini, tool_image_messages
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +50,11 @@ class GeminiProvider(LLMProvider):
         system_parts: list[str] = []
         contents: list[types.Content] = []
 
-        for msg in messages:
+        previous_role = None
+        for msg in tool_image_messages(messages):
             role = msg["role"]
+            follows_tool = previous_role == "tool"
+            previous_role = role
             content = msg.get("content", "")
 
             if role == "system":
@@ -74,13 +77,13 @@ class GeminiProvider(LLMProvider):
                 else:
                     response_data = {"result": str(raw)}
 
-                contents.append(types.Content(
-                    role="user",
-                    parts=[types.Part.from_function_response(
-                        name=fn_name,
-                        response=response_data,
-                    )],
-                ))
+                if msg.get("_tool_is_error"):
+                    response_data = {"error": response_data["result"]}
+                part = types.Part.from_function_response(name=fn_name, response=response_data)
+                if follows_tool:
+                    contents[-1].parts.append(part)
+                else:
+                    contents.append(types.Content(role="user", parts=[part]))
                 continue
 
             if role == "assistant" and msg.get("tool_calls"):
@@ -115,7 +118,10 @@ class GeminiProvider(LLMProvider):
                             ))
 
             if parts:
-                contents.append(types.Content(role=gemini_role, parts=parts))
+                if msg.get("_tool_image_context") and follows_tool:
+                    contents[-1].parts.extend(parts)
+                else:
+                    contents.append(types.Content(role=gemini_role, parts=parts))
 
         system_instruction = "\n\n".join(system_parts) if system_parts else None
         return system_instruction, contents

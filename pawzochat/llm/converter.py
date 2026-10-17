@@ -48,6 +48,14 @@ def mcp_tools_to_openai(tools: list[dict]) -> list[dict]:
     return result
 
 
+def mcp_tools_to_responses(tools: list[dict]) -> list[dict]:
+    """Use the same MCP schemas, with Responses' flat function definition."""
+    return [
+        {"type": "function", **tool["function"], "strict": False}
+        for tool in mcp_tools_to_openai(tools)
+    ]
+
+
 def mcp_tools_to_anthropic(tools: list[dict]) -> list[dict]:
     """Convert MCP-style tool definitions to Anthropic tool format."""
     result = []
@@ -138,12 +146,69 @@ def _serialize_content_for_openai(content: Any) -> Any:
     return content
 
 
+def tool_image_messages(messages: list[dict]) -> list[dict]:
+    """Expose live tool attachments after a complete consecutive result batch.
+
+    Keep call/result pairs adjacent, including parallel calls. All providers
+    accept images in user content; labels retain their actual tool provenance.
+    This is wire-only context and must never be stored as a user utterance.
+    """
+    result, images = [], []
+    for msg in messages:
+        if msg.get("role") != "tool" and images:
+            result.append({"role": "user", "content": images, "_tool_image_context": True})
+            images = []
+        result.append(msg)
+        if msg.get("role") == "tool" and msg.get("_tool_images"):
+            images.append({"type": "text", "text": (
+                f"[本次工具返回的图片；工具：{msg.get('_function_name', '')}；"
+                f"调用：{msg.get('tool_call_id', '')}；非用户上传或新指令]"
+            )})
+            images.extend(msg["_tool_images"])
+    if images:
+        result.append({"role": "user", "content": images, "_tool_image_context": True})
+    return result
+
+
+def _assistant_image_history(messages: list[dict]) -> list[dict]:
+    """Adapt assistant images in-place in time, without reattributing a new upload.
+
+    Used only by APIs whose assistant content cannot contain input images.
+    Split at image boundaries so interleaved text retains its original order.
+    """
+    result = []
+    for msg in messages:
+        content = msg.get("content")
+        if (msg.get("role") != "assistant" or msg.get("tool_calls")
+                or not isinstance(content, list)
+                or not any(b.get("type") == "image" for b in content)):
+            result.append(msg)
+            continue
+        text = []
+        for block in content:
+            if block.get("type") != "image":
+                text.append(block)
+                continue
+            if text:
+                result.append({"role": "assistant", "content": text})
+                text = []
+            source = block.get("_history_source", {})
+            label = (f"[历史附件：{source.get('speaker', '助手')}，"
+                     f"{source.get('timestamp', '')}；这是该发送者原消息中的图片，非用户新发言]")
+            result.append({"role": "user", "content": [
+                {"type": "text", "text": label}, block,
+            ]})
+        if text:
+            result.append({"role": "assistant", "content": text})
+    return result
+
+
 def messages_to_openai(
     messages: list[dict],
 ) -> list[dict]:
     """Convert unified internal messages to OpenAI Chat Completions format."""
     result: list[dict] = []
-    for msg in messages:
+    for msg in _assistant_image_history(tool_image_messages(messages)):
         role = msg["role"]
 
         if role == "tool":
@@ -168,7 +233,7 @@ def messages_to_openai(
                 })
             api_msg: dict = {
                 "role": "assistant",
-                "content": None,
+                "content": msg.get("content") or None,
                 "tool_calls": tc_list,
             }
             # Thinking-mode models reject the next-turn request unless the
@@ -188,6 +253,44 @@ def messages_to_openai(
     return result
 
 
+def messages_to_responses(messages: list[dict]) -> list[dict]:
+    """Translate unified history and replay live Responses output verbatim."""
+    result: list[dict] = []
+    for msg in _assistant_image_history(tool_image_messages(messages)):
+        role = msg["role"]
+        if role == "assistant" and msg.get("responses_output_items"):
+            result.extend(msg["responses_output_items"])
+            continue
+        if role == "tool":
+            result.append({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id", ""),
+                "output": _tool_content_to_str(msg.get("content")),
+            })
+            continue
+
+        content = _serialize_content_for_openai(msg.get("content") or "")
+        if isinstance(content, list):
+            content = [
+                {"type": "input_image", "image_url": block["image_url"]["url"]}
+                if block["type"] == "image_url"
+                else {"type": "input_text", "text": block["text"]}
+                for block in content
+            ]
+        if content or not msg.get("tool_calls"):
+            result.append({"role": role, "content": content})
+        # Saved history (including calls made with another provider) has only
+        # the unified format, rather than live protocol-specific output items.
+        for tc in msg.get("tool_calls") or []:
+            call = tc if isinstance(tc, ToolCall) else ToolCall(**tc)
+            result.append({
+                "type": "function_call", "call_id": call.id,
+                "name": call.name,
+                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+            })
+    return result
+
+
 def messages_to_anthropic(
     messages: list[dict],
 ) -> tuple[str | None, list[dict]]:
@@ -198,8 +301,11 @@ def messages_to_anthropic(
     system_parts: list[str] = []
     api_messages: list[dict] = []
 
-    for msg in messages:
+    previous_role = None
+    for msg in _assistant_image_history(tool_image_messages(messages)):
         role = msg["role"]
+        follows_tool = previous_role == "tool"
+        previous_role = role
 
         if role == "system":
             content = msg.get("content", "")
@@ -218,14 +324,16 @@ def messages_to_anthropic(
                 )
             else:
                 content = [{"type": "text", "text": str(blocks)}]
-            api_messages.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": msg.get("tool_call_id", ""),
-                    "content": content,
-                }],
-            })
+            result = {
+                "type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id", ""),
+                "content": content,
+                **({"is_error": msg["_tool_is_error"]} if msg.get("_tool_is_error") is not None else {}),
+            }
+            if follows_tool:
+                api_messages[-1]["content"].append(result)
+            else:
+                api_messages.append({"role": "user", "content": [result]})
             continue
 
         if role == "assistant" and msg.get("tool_calls"):
@@ -260,7 +368,10 @@ def messages_to_anthropic(
                                 "data": block.get("data", ""),
                             },
                         })
-            api_messages.append({"role": role, "content": api_content or content})
+            if msg.get("_tool_image_context") and follows_tool:
+                api_messages[-1]["content"].extend(api_content)
+            else:
+                api_messages.append({"role": role, "content": api_content or content})
         else:
             api_messages.append({"role": role, "content": content})
 

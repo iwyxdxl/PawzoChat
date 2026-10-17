@@ -28,7 +28,7 @@ import logging
 import threading
 from typing import Any
 
-from pawzochat.llm.base import ContentBlock
+from pawzochat.llm.base import ContentBlock, ToolExecutionResult
 from pawzochat.mcp.client import MCPClient
 
 logger = logging.getLogger(__name__)
@@ -180,13 +180,16 @@ class MCPManager:
         """
         return list(self._tools_cache)
 
-    def call_tool(
+    def call_tool(self, namespaced_name: str, arguments: dict, *, timeout: float = 60.0) -> list[ContentBlock]:
+        return self.call_tool_with_status(namespaced_name, arguments, timeout=timeout).blocks
+
+    def call_tool_with_status(
         self,
         namespaced_name: str,
         arguments: dict,
         *,
         timeout: float = 60.0,
-    ) -> list[ContentBlock]:
+    ) -> ToolExecutionResult:
         """Route a tool call to the appropriate MCP Server (sync wrapper).
 
         ``timeout`` bounds the wait in seconds; on expiry the underlying
@@ -195,22 +198,22 @@ class MCPManager:
         stop hammering the tool. Servers may pin their own ``timeout_seconds``
         in config, which overrides the caller-supplied value.
 
-        Returns structured ``ContentBlock`` list.
+        Returns content blocks together with the MCP success/error status.
         """
         server_name, tool_name = self._parse_namespaced(namespaced_name)
         client = self._clients.get(server_name)
         if not client:
-            return [ContentBlock(type="text", text=f"MCP Server '{server_name}' not found")]
+            return ToolExecutionResult([ContentBlock(text=f"MCP Server '{server_name}' not found")], True)
 
         if not self._loop:
-            return [ContentBlock(type="text", text="MCP event loop not running")]
+            return ToolExecutionResult([ContentBlock(text="MCP event loop not running")], True)
 
         server_timeout = client.configured_timeout
         if server_timeout is not None:
             timeout = server_timeout
 
         future = asyncio.run_coroutine_threadsafe(
-            client.call_tool(tool_name, arguments), self._loop,
+            client.call_tool_with_status(tool_name, arguments), self._loop,
         )
         try:
             return future.result(timeout=timeout)
@@ -219,16 +222,16 @@ class MCPManager:
             logger.warning(
                 "MCP tool 调用超时 (%.1fs): %s", timeout, namespaced_name,
             )
-            return [ContentBlock(
+            return ToolExecutionResult([ContentBlock(
                 type="text",
                 text=(
                     f"工具调用超时（{timeout:.0f}s 内未返回）: {namespaced_name}。"
                     f"请勿继续重复调用此工具，直接告知用户该工具暂不可用即可。"
                 ),
-            )]
+            )], True)
         except Exception as exc:
             logger.exception("MCP tool call failed: %s", namespaced_name)
-            return [ContentBlock(type="text", text=f"工具调用出错: {exc}")]
+            return ToolExecutionResult([ContentBlock(text=f"工具调用出错: {exc}")], True)
 
     def refresh_tools(self):
         """Re-fetch tool lists from all servers."""

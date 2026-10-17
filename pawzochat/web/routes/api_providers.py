@@ -62,13 +62,14 @@ def _provider_summary(name: str, cfg: dict) -> dict:
         ptype = cfg.get("type", "openai_compatible")
         base_url = cfg.get("base_url", "")
 
+    append_field = "append_responses_path" if ptype == "openai_responses" else "append_chat_path"
     return {
         "name": name,
         "preset": preset,
         "type": ptype,
         "base_url": base_url,
         "api_key_set": bool(cfg.get("api_key", "")),
-        "append_chat_path": cfg.get("append_chat_path", True),
+        append_field: cfg.get(append_field, True),
         "models": ensure_models_list(cfg),
     }
 
@@ -116,7 +117,8 @@ def create_provider():
     if preset == "custom":
         entry["type"] = data.get("type", "openai_compatible")
         entry["base_url"] = data.get("base_url", "")
-        entry["append_chat_path"] = data.get("append_chat_path", True)
+        append_field = "append_responses_path" if entry["type"] == "openai_responses" else "append_chat_path"
+        entry[append_field] = data.get(append_field, True)
 
     entry["api_key"] = data.get("api_key", "")
     entry["models"] = data.get("models", ensure_models_list(entry))
@@ -150,7 +152,8 @@ def update_provider(name: str):
     if preset == "custom":
         entry["type"] = data.get("type", providers[name].get("type", "openai_compatible"))
         entry["base_url"] = data.get("base_url", providers[name].get("base_url", ""))
-        entry["append_chat_path"] = data.get("append_chat_path", providers[name].get("append_chat_path", True))
+        append_field = "append_responses_path" if entry["type"] == "openai_responses" else "append_chat_path"
+        entry[append_field] = data.get(append_field, providers[name].get(append_field, True))
 
     if data.get("api_key"):
         entry["api_key"] = data["api_key"]

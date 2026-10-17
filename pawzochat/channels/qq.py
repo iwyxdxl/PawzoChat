@@ -480,7 +480,7 @@ class QQChannel(Channel):
         ``{path, name, mime}`` content blocks.
 
         Unlike images these are not fed to the LLM as bytes — they become a
-        ``[文件]`` name/mime hint (see ``chat._attach_files``). The original
+        ``[文件]`` name/mime hint (see ``chat._file_parts``). The original
         QQ filename is preserved when present.
         """
         files_dir = CHATS_DIR / persona_id / "files"

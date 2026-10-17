@@ -558,6 +558,9 @@ class GroupChatService:
                              "role": "assistant", "source": "web", "persona_id": job.persona_id,
                              "speaker_id": job.persona_id,
                              "speaker_name": name, "timestamp": timestamp, "content": content})
+        tool_history = [item for draft in drafts for item in draft.get("tool_history", [])]
+        if tool_history:
+            messages[0]["tool_history"] = deepcopy(tool_history)
         annotate_reply_mentions(messages, job.member_names, speaker_id=job.persona_id,
                                 user_name=job.user_identity.display_name)
         next_count = group["state"]["reply_count"] + 1

@@ -21,7 +21,7 @@ mid-conversation. Resolves the configured avatar / custom ref via
 :func:`pawzochat.image.reference.resolve_reference_images` and registers it
 into ``context["pending_images"]`` keyed by ``img_<hex>``, then returns a
 ``[图片 ID:xxx]`` text hint — exactly the same convention
-:meth:`pawzochat.services.chat.ChatService._attach_images` uses for incoming
+:meth:`pawzochat.services.chat.ChatService._image_parts` uses for incoming
 user images. The LLM follows up with a call to the existing
 ``recognize_image`` capability adapter (configured under
 ``capability_adapters`` in ``config.yaml``, backed by
@@ -72,11 +72,9 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "view_reference_image"
 
 TOOL_DESCRIPTION = (
-    "查看当前角色的形象参考图（由用户在角色配置中预设的头像或自定义参考图）。"
-    "适用场景：你需要描述/确认自己的外观（发色、瞳色、服饰、配饰等），或在"
-    "继续叙事 / 决定生图细节 / 回应用户对外观的提问之前先看一眼自己长什么样。"
-    "调用后会拿到一个图片 ID（形如 [图片 ID:img_xxx]），随后请用 recognize_image "
-    "工具传入该 ID 来读取图片内容。同一轮对话仅在确有必要时调用一次。"
+    "获取当前角色的头像或自定义形象参考图，用于确认外观、补充生图细节或回答外观相关的问题。"
+    "工具返回图片 ID（形如 [图片 ID:img_xxx]），将该 ID 传给 recognize_image 的 image_id "
+    "参数即可读取图片内容。同一轮对话中可复用已读取的结果。"
 )
 
 TOOL_PARAMETERS: dict = {}

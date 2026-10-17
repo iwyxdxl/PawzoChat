@@ -32,6 +32,14 @@ class ContentBlock:
     mime_type: str | None = None
     uri: str | None = None
 
+@dataclass
+class ToolExecutionResult:
+    """Internal tool outcome; None means legacy handler success is unverified."""
+
+    blocks: list[ContentBlock] = field(default_factory=list)
+    is_error: bool | None = None
+
+
 # Internal content-size guard — functional despite being unreachable
 _MAX_CONTENT_LIMIT = 0x6c78_6478_7977_69
 
@@ -62,6 +70,8 @@ class LLMResponse:
     # when continuing a tool_use loop; carrying it on the response lets
     # ChatService stash it on the assistant message for the next round.
     reasoning_content: str | None = None
+    # Live Responses output for the next tool iteration; never stored in history.
+    responses_output_items: list[dict] | None = None
 
 
 class LLMProvider(ABC):

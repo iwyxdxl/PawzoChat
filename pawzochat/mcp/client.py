@@ -42,7 +42,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 
-from pawzochat.llm.base import ContentBlock
+from pawzochat.llm.base import ContentBlock, ToolExecutionResult
 from pawzochat.paths import APP_HOME
 
 logger = logging.getLogger(__name__)
@@ -302,6 +302,9 @@ class MCPClient:
         return list(self._tools)
 
     async def call_tool(self, tool_name: str, arguments: dict) -> list[ContentBlock]:
+        return (await self.call_tool_with_status(tool_name, arguments)).blocks
+
+    async def call_tool_with_status(self, tool_name: str, arguments: dict) -> ToolExecutionResult:
         """Execute a tool call, reconnecting once on transport failure.
 
         ``McpError`` is raised immediately without retry to avoid duplicate
@@ -326,4 +329,4 @@ class MCPClient:
                 raise
             result = await self._session.call_tool(tool_name, arguments)
 
-        return _mcp_content_to_blocks(result.content)
+        return ToolExecutionResult(_mcp_content_to_blocks(result.content), bool(result.isError))

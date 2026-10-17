@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import base64
 import binascii
 import hashlib
@@ -341,6 +342,7 @@ class ConversationStore:
         local_id: str = "",
         quote_ref: dict | None = None,
         quote_media: list | None = None,
+        tool_history: list[dict] | None = None,
     ) -> dict:
         lock = self._get_lock(persona_id)
         with lock:
@@ -360,6 +362,12 @@ class ConversationStore:
                 msg["quote_ref"] = quote_ref
             if quote_media:
                 msg["quote_media"] = quote_media
+            if role == "assistant" and tool_history:
+                anchor = tool_history[0].get("_context_message_id")
+                # A delayed reply must not restore tool observations from a
+                # deleted/cleared context. No extra cache lifecycle is needed.
+                if not anchor or any(m.get("local_id") == anchor for m in data["messages"]):
+                    msg["tool_history"] = deepcopy(tool_history)
             data["messages"].append(msg)
             data["updated_at"] = msg["timestamp"]
             self._write_file(persona_id, data)

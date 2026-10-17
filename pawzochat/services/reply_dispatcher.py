@@ -48,6 +48,9 @@ class ReplyDispatcher:
         account_id = (reply_ctx or {}).get("account_id", "")
         user_id = (reply_ctx or {}).get("user_id", "")
         is_first = True
+        # Keep the invocation history before the first stored reply, even if
+        # emoji composition prepends a bubble or a pre-send hook cancels one.
+        tool_history = [item for draft in messages for item in draft.get("tool_history", [])]
 
         for index, draft in enumerate(messages):
             is_last = index == len(messages) - 1
@@ -67,12 +70,17 @@ class ReplyDispatcher:
                 continue
 
             message = self._normalize_message(pre_send.message)
+            history_args = ({"tool_history": tool_history}
+                            if tool_history and message.get("role") == "assistant" else {})
             stored = self._app.conversation_store.add_message(
                 persona_id,
                 message.get("role", "assistant"),
                 message.get("content", []),
                 message.get("source", "llm"),
+                **history_args,
             )
+            if message.get("role") == "assistant":
+                tool_history = []
 
             channel_impl = self._app.channel_registry.get(channel, default=None)
             if channel_impl is None:

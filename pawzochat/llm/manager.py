@@ -22,6 +22,7 @@ import logging
 
 from pawzochat.llm.base import LLMProvider
 from pawzochat.llm.providers.openai_compat import OpenAICompatProvider
+from pawzochat.llm.providers.openai_responses import OpenAIResponsesProvider
 from pawzochat.llm.providers.anthropic_provider import AnthropicProvider
 from pawzochat.llm.providers.gemini_provider import GeminiProvider
 
@@ -434,6 +435,7 @@ PRESET_MODELS: dict[str, list[dict]] = {
 
 PROVIDER_CLASSES: dict[str, type[LLMProvider]] = {
     "openai_compatible": OpenAICompatProvider,
+    "openai_responses": OpenAIResponsesProvider,
     "anthropic": AnthropicProvider,
     "gemini": GeminiProvider,
 }
@@ -500,6 +502,8 @@ class LLMManager:
                     init_kwargs["base_url"] = base_url
                 if ptype == "openai_compatible":
                     init_kwargs["append_chat_path"] = cfg.get("append_chat_path", True)
+                if ptype == "openai_responses":
+                    init_kwargs["append_responses_path"] = cfg.get("append_responses_path", True)
 
                 provider = cls(**init_kwargs)
                 self.register_provider(name, provider)

@@ -33,8 +33,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import TYPE_CHECKING, Any
 
-from pawzochat.llm.base import ContentBlock
-from pawzochat.paths import CHATS_DIR
+from pawzochat.llm.base import ContentBlock, ToolExecutionResult
 
 if TYPE_CHECKING:
     from pawzochat.mcp.manager import MCPManager
@@ -292,14 +291,18 @@ class CapabilityAdapterRegistry:
 
     # ---- Execution --------------------------------------------------------
 
-    def execute(
+    def execute(self, tool_name: str, arguments: dict, context: dict | None = None,
+                *, timeout: float = 60.0) -> list[ContentBlock]:
+        return self.execute_with_status(tool_name, arguments, context, timeout=timeout).blocks
+
+    def execute_with_status(
         self,
         tool_name: str,
         arguments: dict,
         context: dict | None = None,
         *,
         timeout: float = 60.0,
-    ) -> list[ContentBlock]:
+    ) -> ToolExecutionResult:
         """Execute a capability adapter call.
 
         For built-in adapters the local handler runs in-process. Otherwise:
@@ -311,22 +314,22 @@ class CapabilityAdapterRegistry:
         with self._lock:
             adapter = self._adapters.get(tool_name)
             if not adapter:
-                return [ContentBlock(type="text", text=f"Unknown capability: {tool_name}")]
+                return ToolExecutionResult([ContentBlock(text=f"Unknown capability: {tool_name}")], True)
             owner = self._owners.get(tool_name, "")
             tracked = owner.startswith("plugin:") and adapter.local_handler is not None
             if tracked:
                 if owner in self._paused_owners:
-                    return [ContentBlock(type="text", text="Plugin is stopping; retry later")]
+                    return ToolExecutionResult([ContentBlock(text="Plugin is stopping; retry later")], True)
                 self._active_owners[owner] = self._active_owners.get(owner, 0) + 1
 
         ctx = context or {}
 
         if adapter.local_handler is not None:
             try:
-                return adapter.local_handler(arguments, ctx)
+                return ToolExecutionResult(adapter.local_handler(arguments, ctx), None)
             except Exception as exc:
                 logger.exception("内置能力执行失败: %s", tool_name)
-                return [ContentBlock(type="text", text=f"工具执行失败: {exc}")]
+                return ToolExecutionResult([ContentBlock(text=f"工具执行失败: {exc}")], True)
             finally:
                 if tracked:
                     with self._lock:
@@ -339,7 +342,7 @@ class CapabilityAdapterRegistry:
         mcp_args = self._build_mcp_args(adapter, arguments, ctx)
 
         namespaced = f"{adapter.mcp_server}__{adapter.mcp_tool}"
-        return self._mcp_manager.call_tool(namespaced, mcp_args, timeout=timeout)
+        return self._mcp_manager.call_tool_with_status(namespaced, mcp_args, timeout=timeout)
 
     def _build_mcp_args(
         self,
@@ -405,10 +408,6 @@ def _resolve_image_data(
         if isinstance(img, bytes):
             return base64.b64encode(img).decode("ascii")
 
-    for path in CHATS_DIR.glob(f"*/images/{image_id}*"):
-        if path.is_file():
-            return base64.b64encode(path.read_bytes()).decode("ascii")
-
     return None
 
 
@@ -439,12 +438,5 @@ def _resolve_file_field(
             if p.is_file():
                 return base64.b64encode(p.read_bytes()).decode("ascii")
         return None
-
-    for path in CHATS_DIR.glob(f"*/files/{file_id}*"):
-        if path.is_file():
-            if field == "path":
-                return str(path)
-            if field == "data":
-                return base64.b64encode(path.read_bytes()).decode("ascii")
 
     return None
